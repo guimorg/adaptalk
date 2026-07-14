@@ -32,7 +32,7 @@ AdaptTUI reads its bearer token from `~/.adapt/config.toml`:
 ```toml
 bearer_token = "paste-your-bearer-token-here"
 # Optional; defaults to Adapt's hosted MCP endpoint.
-endpoint = "https://mcp.adapt.ai/mcp"
+endpoint = "https://app.adapt.com/mcp"
 ```
 
 Create the directory and protect the file before adding your token:

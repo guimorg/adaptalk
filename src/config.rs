@@ -6,7 +6,7 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-pub const DEFAULT_ADAPT_ENDPOINT: &str = "https://mcp.adapt.ai/mcp";
+pub const DEFAULT_ADAPT_ENDPOINT: &str = "https://app.adapt.com/mcp";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdaptConfig {
@@ -97,6 +97,7 @@ mod tests {
         let p = path("default");
         fs::write(&p, "bearer_token = 'secret'").unwrap();
         let c = load_from(&p).unwrap();
+        assert_eq!(DEFAULT_ADAPT_ENDPOINT, "https://app.adapt.com/mcp");
         assert_eq!(c.endpoint, DEFAULT_ADAPT_ENDPOINT);
         assert!(!format!("{c:?}").contains("secret"));
         let _ = fs::remove_file(p);
