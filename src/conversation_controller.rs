@@ -18,7 +18,6 @@ pub trait ConversationQuery {
 
 pub struct Connection<Q> {
     pub query: Q,
-    pub history: SessionHistory,
     pub redactor: Redactor,
 }
 
@@ -38,27 +37,26 @@ enum ConversationState<Q> {
 
 struct ActiveConversation<Q> {
     query: Q,
-    history: SessionHistory,
     session: Session,
 }
 
 pub struct ConversationController<Q> {
     state: ConversationState<Q>,
-    offline_history: SessionHistory,
+    history: SessionHistory,
     redactor: Redactor,
 }
 
 impl<Q: ConversationQuery> ConversationController<Q> {
-    pub fn new(offline_history: SessionHistory) -> Self {
+    pub fn new(history: SessionHistory) -> Self {
         Self {
             state: ConversationState::Disconnected,
-            offline_history,
+            history,
             redactor: Redactor::default(),
         }
     }
 
     pub fn history(&self) -> &SessionHistory {
-        &self.offline_history
+        &self.history
     }
 
     pub fn redactor(&self) -> Redactor {
@@ -76,6 +74,13 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         }
     }
 
+    pub fn viewing_continuation(&self) -> Result<Option<String>> {
+        let Some(session) = self.viewing_session() else {
+            anyhow::bail!("no session is open for viewing");
+        };
+        Ok(self.history.latest_remote_chat_id(session)?)
+    }
+
     /// Start a fresh local session, or a continuation of the viewed session.
     /// Session creation succeeds before state changes, so an error leaves the view intact.
     pub fn connect(&mut self, connection: Connection<Q>) -> Result<()> {
@@ -88,14 +93,13 @@ impl<Q: ConversationQuery> ConversationController<Q> {
             ConversationState::Connected(_) => return Ok(()),
         };
         let session = if let Some(origin) = resumed_from {
-            connection.history.create_continuation(Some(origin))?
+            self.history.create_continuation(Some(origin))?
         } else {
-            connection.history.create()?
+            self.history.create()?
         };
         self.redactor = connection.redactor;
         self.state = ConversationState::Connected(ActiveConversation {
             query: connection.query,
-            history: connection.history,
             session,
         });
         Ok(())
@@ -109,7 +113,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
 
     pub fn finish(&mut self) -> Result<()> {
         if let ConversationState::Connected(active) = &mut self.state {
-            active.history.complete(&mut active.session)?;
+            self.history.complete(&mut active.session)?;
         }
         Ok(())
     }
@@ -118,17 +122,13 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         let ConversationState::Connected(active) = &mut self.state else {
             anyhow::bail!("a connection is required before submitting a prompt");
         };
-        active
-            .history
+        self.history
             .append_prompt(&mut active.session, self.redactor.transcript_text(prompt))?;
-        let continuation = active.history.latest_remote_chat_id(&active.session)?;
+        let continuation = self.history.latest_remote_chat_id(&active.session)?;
         match active.query.query(prompt, continuation.as_deref()).await {
             Ok(response) => {
                 let display = response.as_inner().clone();
-                match active
-                    .history
-                    .append_response(&mut active.session, response)
-                {
+                match self.history.append_response(&mut active.session, response) {
                     Ok(()) => Ok(SubmitOutcome::Response(display)),
                     Err(error) => Ok(SubmitOutcome::ResponseWithPersistenceWarning {
                         response: display,
@@ -137,7 +137,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
                 }
             }
             Err(error) => {
-                active.history.append_error(
+                self.history.append_error(
                     &mut active.session,
                     self.redactor.transcript_text(&error.to_string()),
                 )?;
@@ -200,23 +200,21 @@ mod tests {
         let calls = Rc::new(RefCell::new(vec![]));
         let query = Query {
             calls: calls.clone(),
-            results: Rc::new(RefCell::new(vec![Ok(response(&redactor, None))])),
+            results: Rc::new(RefCell::new(vec![
+                Ok(response(&redactor, None)),
+                Ok(response(&redactor, None)),
+            ])),
         };
-        controller
-            .connect(Connection {
-                query,
-                history: history.clone(),
-                redactor,
-            })
-            .unwrap();
+        controller.connect(Connection { query, redactor }).unwrap();
         controller.submit("next").await.unwrap();
+        controller.submit("after missing chat ID").await.unwrap();
         let sessions = history.list().unwrap();
         assert!(
             sessions
                 .iter()
                 .any(|session| session.resumed_from_session_id.as_ref() == Some(&origin.id))
         );
-        assert_eq!(*calls.borrow(), vec![Some("chat-1".into())]);
+        assert_eq!(*calls.borrow(), vec![Some("chat-1".into()), None]);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -231,7 +229,6 @@ mod tests {
         controller
             .connect(Connection {
                 query,
-                history: history.clone(),
                 redactor: Redactor::default(),
             })
             .unwrap();
@@ -294,13 +291,7 @@ mod tests {
             response: response(&redactor, Some("chat-1")),
         };
         let mut controller = ConversationController::new(history.clone());
-        controller
-            .connect(Connection {
-                query,
-                history,
-                redactor,
-            })
-            .unwrap();
+        controller.connect(Connection { query, redactor }).unwrap();
         assert!(matches!(
             controller.submit("prompt").await.unwrap(),
             SubmitOutcome::ResponseWithPersistenceWarning { .. }
@@ -321,13 +312,7 @@ mod tests {
             ])),
         };
         let mut controller = ConversationController::new(history.clone());
-        controller
-            .connect(Connection {
-                query,
-                history,
-                redactor,
-            })
-            .unwrap();
+        controller.connect(Connection { query, redactor }).unwrap();
         controller.submit("first").await.unwrap();
         controller.submit("second").await.unwrap();
         assert_eq!(*calls.borrow(), vec![None, Some("chat-1".into())]);

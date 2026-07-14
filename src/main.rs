@@ -62,7 +62,6 @@ async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<Connection
             redactor: redactor.clone(),
             allow_unverified_ask_adapt,
         },
-        history: SessionHistory::for_credential_file(&config.source),
         redactor,
     })
 }
@@ -120,7 +119,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                         let opened = controller.open(session)?;
                         repl.clear_transcript()?;
                         render_history(&mut repl, &opened)?;
-                        if opened.latest_remote_chat_id().is_none() {
+                        if controller.viewing_continuation()?.is_none() {
                             repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
                         } else if !allow_unverified_ask_adapt {
                             repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
