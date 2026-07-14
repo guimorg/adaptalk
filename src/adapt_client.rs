@@ -34,8 +34,12 @@ pub enum AdaptClientError {
     AuthenticationRejected,
     #[error("Adapt capability `{0}` is not verified as read-only")]
     CapabilityNotReadOnly(String),
+    #[error("Adapt capability `ask_adapt` requires --allow-unverified-ask-adapt")]
+    AskAdaptOptInRequired,
     #[error("Adapt capability `{0}` returned an error")]
     CapabilityFailed(String),
+    #[error("Adapt has no verified read-only capability available")]
+    NoReadOnlyCapability,
     #[error("Adapt endpoint or transport failed: {0}")]
     Transport(String),
 }
@@ -144,6 +148,74 @@ impl AdaptClient {
             structured_content: result.structured_content,
         })
     }
+
+    /// Invoke Adapt's unverified `ask_adapt` capability for development only.
+    ///
+    /// This seam is intentionally narrower than [`Self::query`]: callers must
+    /// opt in explicitly, and no arbitrary unverified capability can be
+    /// selected through it.
+    pub async fn query_ask_adapt(
+        &self,
+        prompt: &str,
+        allow_unverified: bool,
+    ) -> Result<QueryResponse, AdaptClientError> {
+        ensure_ask_adapt_opt_in(allow_unverified)?;
+
+        self.query_unverified("ask_adapt", prompt).await
+    }
+
+    /// Submit a prompt through the only available verified read-only capability.
+    ///
+    /// Keeping capability selection here prevents the terminal layer from making
+    /// policy decisions or accidentally invoking an unverified tool.
+    pub async fn query_read_only(&self, prompt: &str) -> Result<QueryResponse, AdaptClientError> {
+        let capabilities = self.discover_read_only_capabilities().await?;
+        let capability = capabilities
+            .first()
+            .ok_or(AdaptClientError::NoReadOnlyCapability)?;
+        self.query(&capability.name, prompt).await
+    }
+
+    async fn query_unverified(
+        &self,
+        capability: &str,
+        prompt: &str,
+    ) -> Result<QueryResponse, AdaptClientError> {
+        let tools = self
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| map_transport_error(e, &self.credential))?;
+        if !is_allowed_unverified_capability(capability)
+            || !tools.into_iter().any(|tool| tool.name == capability)
+        {
+            return Err(AdaptClientError::CapabilityNotReadOnly(
+                capability.to_owned(),
+            ));
+        }
+
+        let mut arguments = Map::new();
+        arguments.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
+        let result: CallToolResult = self
+            .service
+            .peer()
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: capability.to_owned().into(),
+                arguments: Some(arguments),
+                task: None,
+            })
+            .await
+            .map_err(|e| map_transport_error(e, &self.credential))?;
+        if result.is_error == Some(true) {
+            return Err(AdaptClientError::CapabilityFailed(capability.to_owned()));
+        }
+        Ok(QueryResponse {
+            content: result.content,
+            structured_content: result.structured_content,
+        })
+    }
 }
 
 fn is_verified_read_only(tool: &rmcp::model::Tool) -> bool {
@@ -180,6 +252,18 @@ fn sanitize_transport_error(text: &str, credential: &str) -> String {
         return text.to_owned();
     }
     text.replace(credential, "[redacted credential]")
+}
+
+fn ensure_ask_adapt_opt_in(allow_unverified: bool) -> Result<(), AdaptClientError> {
+    if allow_unverified {
+        Ok(())
+    } else {
+        Err(AdaptClientError::AskAdaptOptInRequired)
+    }
+}
+
+fn is_allowed_unverified_capability(capability: &str) -> bool {
+    capability == "ask_adapt"
 }
 
 #[cfg(test)]
@@ -250,5 +334,27 @@ mod tests {
             },
         );
         assert!(!is_verified_read_only(&tool));
+    }
+
+    #[test]
+    fn ask_adapt_requires_explicit_opt_in() {
+        assert!(matches!(
+            ensure_ask_adapt_opt_in(false),
+            Err(AdaptClientError::AskAdaptOptInRequired)
+        ));
+        assert!(ensure_ask_adapt_opt_in(true).is_ok());
+    }
+
+    #[test]
+    fn arbitrary_unverified_capabilities_are_not_allowed_by_ask_adapt_policy() {
+        assert!(!is_allowed_unverified_capability("other_tool"));
+        assert!(is_allowed_unverified_capability("ask_adapt"));
+    }
+
+    #[test]
+    fn opt_in_error_does_not_include_credentials() {
+        let error = ensure_ask_adapt_opt_in(false).unwrap_err().to_string();
+        assert!(!error.contains("secret"));
+        assert!(error.contains("--allow-unverified-ask-adapt"));
     }
 }
