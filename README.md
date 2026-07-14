@@ -64,6 +64,13 @@ AdaptTUI first connects to the Adapt MCP Server and discovers capabilities, then
 - Press Ctrl-C to exit.
 - AdaptTUI invokes only capabilities verified as read-only. If none are available, the terminal displays that error rather than invoking an ambiguous capability.
 
+After a successful connection, AdaptTUI saves a redacted JSON snapshot after every prompt and response in `~/.adapt/sessions/` (next to, but separate from, `~/.adapt/config.toml`). A session left running by Ctrl-C or process termination is shown as **interrupted** and can still be read. The configured bearer token, bearer strings, and common sensitive JSON fields are redacted before anything is written.
+
+Two REPL commands work entirely locally, before any configuration is read or MCP connection is made:
+
+- `/history` lists saved sessions with their ID, status, and first-prompt summary.
+- `/open <id>` renders one saved transcript. It does not contact Adapt or continue the remote conversation.
+
 The connectivity milestone initializes against Adapt's hosted endpoint and discovers its capabilities. The client query seam accepts a prompt, invokes only a selected verified read-only capability, and preserves structured MCP results for the terminal layer.
 
 For development investigations only, `ask_adapt` can be enabled with an explicit process-only opt-in:

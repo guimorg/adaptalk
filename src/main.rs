@@ -1,7 +1,8 @@
 use adapt_tui::{
     adapt_client::{AdaptClient, QueryResponse},
-    chat_terminal::Repl,
+    chat_terminal::{Repl, ReplCommand, parse_command},
     config,
+    session_history::{Session, SessionEntryKind, SessionHistory},
 };
 use anyhow::Result;
 use clap::Parser;
@@ -53,28 +54,59 @@ async fn run_prompt(client: &AdaptClient, args: &Cli) -> Result<()> {
 
 async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut repl = Repl::start(allow_unverified_ask_adapt)?;
-    let client: Result<AdaptClient> = async {
-        let config = config::load()?;
-        let client = AdaptClient::connect(&config).await?;
-        client.discover_capabilities().await?;
-        Ok(client)
-    }
-    .await;
-    let client = match client {
-        Ok(client) => client,
-        Err(error) => {
-            repl.show_error(&error.to_string())?;
-            return Ok(());
-        }
-    };
-
+    let offline_history = SessionHistory::for_credential_file(config::default_config_path()?, "");
+    let mut client = None;
+    let mut history: Option<SessionHistory> = None;
+    let mut session: Option<Session> = None;
     let mut remote_chat_id = None;
     loop {
         let Some(prompt) = repl.read_prompt()? else {
+            if let (Some(history), Some(session)) = (&history, &mut session) {
+                history.complete(session)?;
+            }
             return Ok(());
         };
         if prompt.is_empty() {
             continue;
+        }
+        if let Some(command) = parse_command(&prompt) {
+            match command {
+                ReplCommand::History => show_history(&mut repl, &offline_history)?,
+                ReplCommand::Open(id) => open_history(&mut repl, &offline_history, &id)?,
+                ReplCommand::Unknown(message) => repl.show_error(&message)?,
+            }
+            continue;
+        }
+        if client.is_none() {
+            let config = match config::load() {
+                Ok(config) => config,
+                Err(error) => {
+                    repl.show_error(&error.to_string())?;
+                    continue;
+                }
+            };
+            let connected = match AdaptClient::connect(&config).await {
+                Ok(client) => match client.discover_capabilities().await {
+                    Ok(_) => client,
+                    Err(error) => {
+                        repl.show_error(&error.to_string())?;
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    repl.show_error(&error.to_string())?;
+                    continue;
+                }
+            };
+            let session_history =
+                SessionHistory::for_credential_file(&config.source, &config.bearer_token);
+            session = Some(session_history.create()?);
+            history = Some(session_history);
+            client = Some(connected);
+        }
+        let client = client.as_ref().expect("initialized above");
+        if let (Some(history), Some(session)) = (&history, &mut session) {
+            history.append_prompt(session, &prompt)?;
         }
         repl.show_working()?;
         let result = if allow_unverified_ask_adapt {
@@ -89,11 +121,105 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 if let Some(chat_id) = response.chat_id.clone() {
                     remote_chat_id = Some(chat_id);
                 }
+                if let (Some(history), Some(session)) = (&history, &mut session) {
+                    append_history_response(history, session, &response)?;
+                }
                 append_response(&mut repl, response)?;
             }
             Err(error) => repl.show_error(&error.to_string())?,
         }
     }
+}
+
+fn append_history_response(
+    history: &SessionHistory,
+    session: &mut Session,
+    response: &QueryResponse,
+) -> Result<()> {
+    let content = response
+        .content
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    history.append_response(
+        session,
+        content,
+        response.structured_content.clone(),
+        response.chat_id.clone(),
+    )?;
+    Ok(())
+}
+
+fn show_history(repl: &mut Repl, history: &SessionHistory) -> Result<()> {
+    let sessions = history.list()?;
+    if sessions.is_empty() {
+        return Ok(repl.show_notice("No local sessions saved yet.")?);
+    }
+    for session in sessions {
+        let prompt = session
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                SessionEntryKind::Prompt { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("(no prompts)");
+        repl.show_notice(&format!(
+            "{} · {} · {}",
+            session.id,
+            session.status.display_name(),
+            compact(prompt)
+        ))?;
+    }
+    Ok(())
+}
+
+fn open_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<()> {
+    let session = match history.load(id) {
+        Ok(session) => session,
+        Err(error) => {
+            repl.show_error(&error.to_string())?;
+            return Ok(());
+        }
+    };
+    repl.show_notice(&format!(
+        "Session {} · {}",
+        session.id,
+        session.status.display_name()
+    ))?;
+    for entry in session.entries {
+        match entry.kind {
+            SessionEntryKind::Prompt { text } => repl.show_you(&text)?,
+            SessionEntryKind::Response {
+                content,
+                structured_result,
+                ..
+            } => {
+                for item in content {
+                    repl.show_adapt(&stored_content(&item))?;
+                }
+                if let Some(value) = structured_result {
+                    repl.show_structured_result(value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stored_content(value: &serde_json::Value) -> String {
+    value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            serde_json::to_string(value)
+                .unwrap_or_else(|_| "[unrenderable response content]".into())
+        })
+}
+
+fn compact(text: &str) -> String {
+    text.chars().take(72).collect()
 }
 
 fn append_response(repl: &mut Repl, response: QueryResponse) -> std::io::Result<()> {
@@ -212,6 +338,14 @@ mod tests {
         };
         assert_eq!(content, "Hi Guilherme! What can I help with today?");
         assert_eq!(redact_text("Bearer secret"), "Bearer [redacted]");
+    }
+
+    #[test]
+    fn saved_text_content_is_rendered_as_text() {
+        assert_eq!(
+            super::stored_content(&serde_json::json!({"type": "text", "text": "Saved reply"})),
+            "Saved reply"
+        );
     }
 
     #[test]

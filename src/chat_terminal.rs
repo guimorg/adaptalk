@@ -13,6 +13,32 @@ pub struct Repl {
     waiting: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplCommand {
+    History,
+    Open(String),
+    Unknown(String),
+}
+
+pub fn parse_command(input: &str) -> Option<ReplCommand> {
+    let input = input.trim();
+    if !input.starts_with('/') {
+        return None;
+    }
+    match input.split_once(char::is_whitespace) {
+        Some(("/open", id)) if !id.trim().is_empty() => {
+            Some(ReplCommand::Open(id.trim().to_owned()))
+        }
+        Some(("/open", _)) | None if input == "/open" => {
+            Some(ReplCommand::Unknown("/open requires a session ID".into()))
+        }
+        Some(("/history", _)) | None if input == "/history" => Some(ReplCommand::History),
+        _ => Some(ReplCommand::Unknown(format!(
+            "unknown command `{input}`; use /history or /open <id>"
+        ))),
+    }
+}
+
 impl Repl {
     pub fn start(unverified_development_mode: bool) -> io::Result<Self> {
         let mut repl = Self {
@@ -47,6 +73,14 @@ impl Repl {
         self.write_plain(": is working…\n")?;
         self.waiting = true;
         Ok(())
+    }
+
+    pub fn show_you(&mut self, message: &str) -> io::Result<()> {
+        self.write_message("You", Color::Cyan, &redact_text(message))
+    }
+
+    pub fn show_notice(&mut self, message: &str) -> io::Result<()> {
+        self.write_message("History", Color::Green, message)
     }
 
     pub fn show_adapt(&mut self, message: &str) -> io::Result<()> {
@@ -189,7 +223,7 @@ pub fn redact_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_text, redact_value};
+    use super::{ReplCommand, parse_command, redact_text, redact_value};
 
     #[test]
     fn text_errors_redact_bearer_credentials() {
@@ -205,5 +239,18 @@ mod tests {
             redact_value(serde_json::json!({"citation": "runbook", "bearer_token": "secret"}));
         assert_eq!(value["citation"], "runbook");
         assert_eq!(value["bearer_token"], "[redacted]");
+    }
+
+    #[test]
+    fn recognizes_history_and_open_commands() {
+        assert_eq!(parse_command("/history"), Some(ReplCommand::History));
+        assert_eq!(
+            parse_command("/open abc"),
+            Some(ReplCommand::Open("abc".into()))
+        );
+        assert!(matches!(
+            parse_command("/wat"),
+            Some(ReplCommand::Unknown(_))
+        ));
     }
 }
