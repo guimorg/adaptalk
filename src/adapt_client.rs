@@ -70,6 +70,7 @@ pub fn filter_capabilities(
 
 pub struct AdaptClient {
     service: rmcp::service::RunningService<rmcp::RoleClient, ClientHandlerImpl>,
+    credential: String,
 }
 #[derive(Default)]
 struct ClientHandlerImpl;
@@ -81,22 +82,23 @@ impl AdaptClient {
             StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone())
                 .auth_header(format!("Bearer {}", config.bearer_token)),
         );
-        let service = ClientHandlerImpl.serve(transport).await.map_err(|e| {
-            let text = e.to_string().to_ascii_lowercase();
-            if text.contains("401") || text.contains("403") || text.contains("auth") {
-                AdaptClientError::AuthenticationRejected
-            } else {
-                AdaptClientError::Transport(sanitize_transport_error(&text))
-            }
-        })?;
-        Ok(Self { service })
+        let service = ClientHandlerImpl
+            .serve(transport)
+            .await
+            .map_err(|e| map_transport_error(e, &config.bearer_token))?;
+        Ok(Self {
+            service,
+            credential: config.bearer_token.clone(),
+        })
     }
 
     pub async fn discover_capabilities(&self) -> Result<Vec<Capability>, AdaptClientError> {
-        let tools =
-            self.service.peer().list_all_tools().await.map_err(|e| {
-                AdaptClientError::Transport(sanitize_transport_error(&e.to_string()))
-            })?;
+        let tools = self
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| map_transport_error(e, &self.credential))?;
         filter_capabilities(tools.into_iter().map(|tool| AdvertisedCapability {
             name: tool.name.to_string(),
             description: tool.description.map(|d| d.to_string()),
@@ -108,10 +110,25 @@ impl AdaptClient {
     }
 }
 
-fn sanitize_transport_error(text: &str) -> String {
-    text.replace("authorization", "authentication")
-        .replace("bearer", "credential")
-        .replace("token", "credential")
+fn map_transport_error(error: impl std::fmt::Display, credential: &str) -> AdaptClientError {
+    let text = error.to_string();
+    let normalized = text.to_ascii_lowercase();
+    if normalized.contains("auth required")
+        || normalized.contains("insufficient scope")
+        || normalized.contains("status code: 401")
+        || normalized.contains("status code: 403")
+    {
+        AdaptClientError::AuthenticationRejected
+    } else {
+        AdaptClientError::Transport(sanitize_transport_error(&text, credential))
+    }
+}
+
+fn sanitize_transport_error(text: &str, credential: &str) -> String {
+    if credential.is_empty() {
+        return text.to_owned();
+    }
+    text.replace(credential, "[redacted credential]")
 }
 
 #[cfg(test)]
@@ -148,5 +165,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn transport_errors_redact_the_credential() {
+        let error = map_transport_error(
+            "request failed for Bearer super-secret-token",
+            "super-secret-token",
+        );
+        let AdaptClientError::Transport(message) = error else {
+            panic!("expected transport error");
+        };
+        assert!(!message.contains("super-secret-token"));
+        assert!(message.contains("[redacted credential]"));
+    }
+
+    #[test]
+    fn authentication_errors_are_classified_consistently() {
+        assert!(matches!(
+            map_transport_error("server returned status code: 401", "secret"),
+            AdaptClientError::AuthenticationRejected
+        ));
+        assert!(matches!(
+            map_transport_error("Auth required", "secret"),
+            AdaptClientError::AuthenticationRejected
+        ));
+        assert!(matches!(
+            map_transport_error("server returned status code: 403", ""),
+            AdaptClientError::AuthenticationRejected
+        ));
     }
 }
