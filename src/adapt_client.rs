@@ -7,7 +7,9 @@ use rmcp::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::future::Future;
 use thiserror::Error;
+use tokio::sync::OnceCell;
 
 use crate::config::AdaptConfig;
 
@@ -47,6 +49,25 @@ pub enum AdaptClientError {
 pub struct AdaptClient {
     service: rmcp::service::RunningService<rmcp::RoleClient, ClientHandlerImpl>,
     credential: String,
+    capabilities: CapabilityCache,
+}
+
+#[derive(Default)]
+struct CapabilityCache {
+    tools: OnceCell<Vec<rmcp::model::Tool>>,
+}
+
+impl CapabilityCache {
+    async fn get_or_try_init<L, F>(
+        &self,
+        loader: L,
+    ) -> Result<&[rmcp::model::Tool], AdaptClientError>
+    where
+        L: FnOnce() -> F,
+        F: Future<Output = Result<Vec<rmcp::model::Tool>, AdaptClientError>>,
+    {
+        self.tools.get_or_try_init(loader).await.map(Vec::as_slice)
+    }
 }
 #[derive(Default)]
 struct ClientHandlerImpl;
@@ -62,21 +83,17 @@ impl AdaptClient {
         Ok(Self {
             service,
             credential: config.bearer_token.clone(),
+            capabilities: CapabilityCache::default(),
         })
     }
 
     pub async fn discover_capabilities(&self) -> Result<Vec<Capability>, AdaptClientError> {
-        let tools = self
-            .service
-            .peer()
-            .list_all_tools()
-            .await
-            .map_err(|e| map_transport_error(e, &self.credential))?;
+        let tools = self.cached_tools().await?;
         Ok(tools
-            .into_iter()
+            .iter()
             .map(|tool| Capability {
                 name: tool.name.to_string(),
-                description: tool.description.map(|d| d.to_string()),
+                description: tool.description.as_ref().map(|d| d.to_string()),
             })
             .collect())
     }
@@ -88,18 +105,13 @@ impl AdaptClient {
     pub async fn discover_read_only_capabilities(
         &self,
     ) -> Result<Vec<Capability>, AdaptClientError> {
-        let tools = self
-            .service
-            .peer()
-            .list_all_tools()
-            .await
-            .map_err(|e| map_transport_error(e, &self.credential))?;
+        let tools = self.cached_tools().await?;
         Ok(tools
-            .into_iter()
-            .filter(is_verified_read_only)
+            .iter()
+            .filter(|tool| is_verified_read_only(tool))
             .map(|tool| Capability {
                 name: tool.name.to_string(),
-                description: tool.description.map(|d| d.to_string()),
+                description: tool.description.as_ref().map(|d| d.to_string()),
             })
             .collect())
     }
@@ -110,43 +122,19 @@ impl AdaptClient {
         capability: &str,
         prompt: &str,
     ) -> Result<QueryResponse, AdaptClientError> {
-        let tools = self
-            .service
-            .peer()
-            .list_all_tools()
-            .await
-            .map_err(|e| map_transport_error(e, &self.credential))?;
-        let Some(tool) = tools.into_iter().find(|tool| tool.name == capability) else {
+        let tools = self.cached_tools().await?;
+        let Some(tool) = tools.iter().find(|tool| tool.name == capability) else {
             return Err(AdaptClientError::CapabilityNotReadOnly(
                 capability.to_owned(),
             ));
         };
-        if !is_verified_read_only(&tool) {
+        if !is_verified_read_only(tool) {
             return Err(AdaptClientError::CapabilityNotReadOnly(
                 capability.to_owned(),
             ));
         }
 
-        let mut arguments = Map::new();
-        arguments.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
-        let result: CallToolResult = self
-            .service
-            .peer()
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: capability.to_owned().into(),
-                arguments: Some(arguments),
-                task: None,
-            })
-            .await
-            .map_err(|e| map_transport_error(e, &self.credential))?;
-        if result.is_error == Some(true) {
-            return Err(AdaptClientError::CapabilityFailed(capability.to_owned()));
-        }
-        Ok(QueryResponse {
-            content: result.content,
-            structured_content: result.structured_content,
-        })
+        self.invoke_tool(capability, prompt).await
     }
 
     /// Invoke Adapt's unverified `ask_adapt` capability for development only.
@@ -161,7 +149,15 @@ impl AdaptClient {
     ) -> Result<QueryResponse, AdaptClientError> {
         ensure_ask_adapt_opt_in(allow_unverified)?;
 
-        self.query_unverified("ask_adapt", prompt).await
+        let tools = self.cached_tools().await?;
+        if !is_allowed_unverified_capability("ask_adapt")
+            || !tools.iter().any(|tool| tool.name == "ask_adapt")
+        {
+            return Err(AdaptClientError::CapabilityNotReadOnly(
+                "ask_adapt".to_owned(),
+            ));
+        }
+        self.invoke_tool("ask_adapt", prompt).await
     }
 
     /// Submit a prompt through the only available verified read-only capability.
@@ -169,32 +165,31 @@ impl AdaptClient {
     /// Keeping capability selection here prevents the terminal layer from making
     /// policy decisions or accidentally invoking an unverified tool.
     pub async fn query_read_only(&self, prompt: &str) -> Result<QueryResponse, AdaptClientError> {
-        let capabilities = self.discover_read_only_capabilities().await?;
-        let capability = capabilities
-            .first()
+        let tools = self.cached_tools().await?;
+        let tool = tools
+            .iter()
+            .find(|tool| is_verified_read_only(tool))
             .ok_or(AdaptClientError::NoReadOnlyCapability)?;
-        self.query(&capability.name, prompt).await
+        self.invoke_tool(tool.name.as_ref(), prompt).await
     }
 
-    async fn query_unverified(
+    async fn cached_tools(&self) -> Result<&[rmcp::model::Tool], AdaptClientError> {
+        self.capabilities
+            .get_or_try_init(|| async {
+                self.service
+                    .peer()
+                    .list_all_tools()
+                    .await
+                    .map_err(|e| map_transport_error(e, &self.credential))
+            })
+            .await
+    }
+
+    async fn invoke_tool(
         &self,
         capability: &str,
         prompt: &str,
     ) -> Result<QueryResponse, AdaptClientError> {
-        let tools = self
-            .service
-            .peer()
-            .list_all_tools()
-            .await
-            .map_err(|e| map_transport_error(e, &self.credential))?;
-        if !is_allowed_unverified_capability(capability)
-            || !tools.into_iter().any(|tool| tool.name == capability)
-        {
-            return Err(AdaptClientError::CapabilityNotReadOnly(
-                capability.to_owned(),
-            ));
-        }
-
         let mut arguments = Map::new();
         arguments.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
         let result: CallToolResult = self
@@ -269,6 +264,11 @@ fn is_allowed_unverified_capability(capability: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Barrier;
 
     #[test]
     fn transport_errors_redact_the_credential() {
@@ -356,5 +356,88 @@ mod tests {
         let error = ensure_ask_adapt_opt_in(false).unwrap_err().to_string();
         assert!(!error.contains("secret"));
         assert!(error.contains("--allow-unverified-ask-adapt"));
+    }
+
+    fn test_tool(name: &str) -> rmcp::model::Tool {
+        rmcp::model::Tool::new(name.to_owned(), format!("{name} query"), Map::new())
+    }
+
+    #[tokio::test]
+    async fn cache_shares_one_load_across_reads() {
+        let cache = CapabilityCache::default();
+        let loads = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let loads = Arc::clone(&loads);
+            let tools = cache
+                .get_or_try_init(|| async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![test_tool("safe")])
+                })
+                .await
+                .unwrap();
+            assert_eq!(tools[0].name, "safe");
+        }
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_access_initializes_cache_once() {
+        let cache = Arc::new(CapabilityCache::default());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let loads = Arc::clone(&loads);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache
+                    .get_or_try_init(|| async move {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![test_tool("safe")])
+                    })
+                    .await
+                    .unwrap()
+                    .len()
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), 1);
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_load_does_not_poison_cache() {
+        let cache = CapabilityCache::default();
+        let loads = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let loads = Arc::clone(&loads);
+            cache
+                .get_or_try_init(|| async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Err(AdaptClientError::Transport("temporary failure".into()))
+                })
+                .await
+        };
+        assert!(first.is_err());
+
+        let second = {
+            let loads = Arc::clone(&loads);
+            cache
+                .get_or_try_init(|| async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![test_tool("safe")])
+                })
+                .await
+        };
+        assert_eq!(second.unwrap()[0].name, "safe");
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 }
