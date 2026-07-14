@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use crate::redaction::Redactor;
 use crossterm::{
     cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -13,6 +14,7 @@ pub struct Repl {
     stdout: io::Stdout,
     waiting: bool,
     unverified_development_mode: bool,
+    redactor: Redactor,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,9 +91,14 @@ impl Repl {
             stdout: io::stdout(),
             waiting: false,
             unverified_development_mode,
+            redactor: Redactor::default(),
         };
         repl.clear_transcript()?;
         Ok(repl)
+    }
+
+    pub fn set_redactor(&mut self, redactor: Redactor) {
+        self.redactor = redactor;
     }
 
     pub fn clear_transcript(&mut self) -> io::Result<()> {
@@ -121,12 +128,23 @@ impl Repl {
             }
             match key.code {
                 KeyCode::Enter => {
+                    if let Some(completed) = completed_command(&input) {
+                        input = completed;
+                        self.render_input(&input, palette_rows)?;
+                        palette_rows = command_palette_rows(&input);
+                        continue;
+                    }
                     self.clear_command_palette(palette_rows)?;
                     self.write_plain("\r\n")?;
                     return Ok(Some(input.trim().to_owned()));
                 }
                 KeyCode::Backspace => {
                     input.pop();
+                }
+                KeyCode::Tab => {
+                    if let Some(completed) = completed_command(&input) {
+                        input = completed;
+                    }
                 }
                 KeyCode::Esc => input.clear(),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -157,21 +175,21 @@ impl Repl {
     }
 
     pub fn show_you(&mut self, message: &str) -> io::Result<()> {
-        self.write_message("You", Color::Cyan, &redact_text(message))
+        self.write_message("You", Color::Cyan, &self.redactor.text(message))
     }
 
     pub fn show_notice(&mut self, message: &str) -> io::Result<()> {
-        self.write_message("History", Color::Green, message)
+        self.write_message("History", Color::Green, &self.redactor.text(message))
     }
 
     pub fn show_adapt(&mut self, message: &str) -> io::Result<()> {
         self.clear_working()?;
-        self.write_message("Adapt", Color::Magenta, &redact_text(message))
+        self.write_message("Adapt", Color::Magenta, &self.redactor.text(message))
     }
 
     pub fn show_structured_result(&mut self, value: Value) -> io::Result<()> {
         self.clear_working()?;
-        let rendered = serde_json::to_string_pretty(&redact_value(value))
+        let rendered = serde_json::to_string_pretty(&self.redactor.value(value))
             .unwrap_or_else(|_| "[unrenderable structured result]".to_owned());
         self.write_message("Result", Color::Blue, &rendered)
     }
@@ -185,7 +203,10 @@ impl Repl {
         self.write_message(
             "Error",
             Color::Red,
-            &format!("Could not complete this prompt: {}", redact_text(message)),
+            &format!(
+                "Could not complete this prompt: {}",
+                self.redactor.text(message)
+            ),
         )
     }
 
@@ -303,85 +324,27 @@ fn command_palette_rows(input: &str) -> u16 {
     }
 }
 
-fn redact_value(value: Value) -> Value {
-    match value {
-        Value::Object(values) => Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| {
-                    let sensitive = ["token", "authorization", "credential"]
-                        .iter()
-                        .any(|term| key.to_ascii_lowercase().contains(term));
-                    (
-                        key,
-                        if sensitive {
-                            Value::String("[redacted]".to_owned())
-                        } else {
-                            redact_value(value)
-                        },
-                    )
-                })
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.into_iter().map(redact_value).collect()),
-        Value::String(text) => Value::String(redact_text(&text)),
-        other => other,
+fn completed_command(input: &str) -> Option<String> {
+    if input.chars().any(char::is_whitespace) {
+        return None;
     }
-}
-
-pub fn redact_text(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut redact_next = false;
-    let mut word_start = None;
-    for (index, character) in text.char_indices() {
-        if character.is_whitespace() {
-            if let Some(start) = word_start.take() {
-                let word = &text[start..index];
-                if redact_next {
-                    output.push_str("[redacted]");
-                } else {
-                    output.push_str(word);
-                }
-                redact_next = word.eq_ignore_ascii_case("bearer");
-            }
-            output.push(character);
-        } else if word_start.is_none() {
-            word_start = Some(index);
-        }
+    let commands = matching_commands(input);
+    let (command, _) = commands.as_slice().first()?;
+    if commands.len() != 1 || *command == input {
+        return None;
     }
-    if let Some(start) = word_start {
-        let word = &text[start..];
-        if redact_next {
-            output.push_str("[redacted]");
-        } else {
-            output.push_str(word);
-        }
-    }
-    output
+    Some(if *command == "/open <id>" {
+        "/open ".into()
+    } else {
+        (*command).into()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplCommand, matching_commands, parse_command, redact_text, redact_value,
-        shows_command_palette,
+        ReplCommand, completed_command, matching_commands, parse_command, shows_command_palette,
     };
-
-    #[test]
-    fn text_errors_redact_bearer_credentials() {
-        assert_eq!(
-            redact_text("request failed for Bearer secret"),
-            "request failed for Bearer [redacted]"
-        );
-    }
-
-    #[test]
-    fn structured_results_redact_sensitive_values() {
-        let value =
-            redact_value(serde_json::json!({"citation": "runbook", "bearer_token": "secret"}));
-        assert_eq!(value["citation"], "runbook");
-        assert_eq!(value["bearer_token"], "[redacted]");
-    }
 
     #[test]
     fn recognizes_history_and_open_commands() {
@@ -423,5 +386,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/open <id>"]
         );
+    }
+
+    #[test]
+    fn fuzzy_match_completes_to_a_canonical_command() {
+        assert_eq!(completed_command("/his"), Some("/history".into()));
+        assert_eq!(completed_command("/pn"), Some("/open ".into()));
+        assert_eq!(completed_command("/history"), None);
     }
 }

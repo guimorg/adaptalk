@@ -1,7 +1,10 @@
 //! Secret-safe, local-only Adapt conversation snapshots.
+//!
+//! This module owns file lifecycle only. Callers must pass display-oriented,
+//! already-redacted entries through the application redaction boundary.
 
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -12,6 +15,41 @@ use serde_json::Value;
 use thiserror::Error;
 
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn generate() -> Self {
+        Self(format!(
+            "{}-{}-{}",
+            timestamp_ms(),
+            std::process::id(),
+            SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, HistoryError> {
+        let valid = value.split('-').count() == 3
+            && value
+                .split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+        if valid {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(HistoryError::InvalidId {
+                id: value.to_owned(),
+            })
+        }
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,28 +74,40 @@ pub struct SessionEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextBlock {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Citation {
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptResponse {
+    pub text_blocks: Vec<TextBlock>,
+    pub structured_result: Option<Value>,
+    pub citations: Vec<Citation>,
+    pub remote_chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEntryKind {
-    Prompt {
-        text: String,
-    },
-    Response {
-        content: Vec<Value>,
-        structured_result: Option<Value>,
-        citations: Vec<Value>,
-        remote_chat_id: Option<String>,
-    },
+    Prompt { text: String },
+    Response(TranscriptResponse),
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
-    pub id: String,
+    pub id: SessionId,
     pub started_at_ms: u128,
     pub updated_at_ms: u128,
     pub status: SessionStatus,
     pub remote_chat_id: Option<String>,
     #[serde(default)]
-    pub resumed_from_session_id: Option<String>,
+    pub resumed_from_session_id: Option<SessionId>,
     pub entries: Vec<SessionEntry>,
 }
 
@@ -71,6 +121,8 @@ pub enum HistoryError {
     Read { path: PathBuf },
     #[error("local session `{id}` was not found")]
     NotFound { id: String },
+    #[error("local session ID `{id}` is invalid")]
+    InvalidId { id: String },
     #[error("local session history at {path} is malformed")]
     Malformed { path: PathBuf },
 }
@@ -78,139 +130,105 @@ pub enum HistoryError {
 #[derive(Clone)]
 pub struct SessionHistory {
     directory: PathBuf,
-    token: String,
 }
 
 impl SessionHistory {
-    pub fn for_credential_file(
-        credential_file: impl AsRef<Path>,
-        token: impl Into<String>,
-    ) -> Self {
+    pub fn for_credential_file(credential_file: impl AsRef<Path>) -> Self {
         let directory = credential_file
             .as_ref()
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sessions");
-        Self {
-            directory,
-            token: token.into(),
-        }
+        Self { directory }
     }
-
-    pub fn at(directory: impl Into<PathBuf>, token: impl Into<String>) -> Self {
+    pub fn at(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
-            token: token.into(),
         }
     }
-
     pub fn directory(&self) -> &Path {
         &self.directory
     }
-
     pub fn create(&self) -> Result<Session, HistoryError> {
         self.create_continuation(None, None)
     }
-
     pub fn create_continuation(
         &self,
-        resumed_from_session_id: Option<&str>,
-        remote_chat_id: Option<&str>,
+        resumed_from_session_id: Option<SessionId>,
+        remote_chat_id: Option<String>,
     ) -> Result<Session, HistoryError> {
         let now = timestamp_ms();
         let mut session = Session {
-            id: format!(
-                "{}-{}-{}",
-                now,
-                std::process::id(),
-                SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ),
+            id: SessionId::generate(),
             started_at_ms: now,
             updated_at_ms: now,
             status: SessionStatus::Active,
-            remote_chat_id: remote_chat_id.map(|id| self.redact_text(id)),
-            resumed_from_session_id: resumed_from_session_id.map(str::to_owned),
-            entries: Vec::new(),
+            remote_chat_id,
+            resumed_from_session_id,
+            entries: vec![],
         };
         self.save(&mut session)?;
         Ok(session)
     }
-
-    pub fn append_prompt(&self, session: &mut Session, prompt: &str) -> Result<(), HistoryError> {
-        session.entries.push(SessionEntry {
-            timestamp_ms: timestamp_ms(),
-            kind: SessionEntryKind::Prompt {
-                text: self.redact_text(prompt),
-            },
-        });
-        self.save(session)
+    pub fn append_prompt(&self, session: &mut Session, text: String) -> Result<(), HistoryError> {
+        self.append(session, SessionEntryKind::Prompt { text })
     }
-
     pub fn append_response(
         &self,
         session: &mut Session,
-        content: Vec<Value>,
-        structured_result: Option<Value>,
-        remote_chat_id: Option<String>,
+        response: TranscriptResponse,
     ) -> Result<(), HistoryError> {
-        let content = content
-            .into_iter()
-            .map(|value| self.redact_value(value))
-            .collect::<Vec<_>>();
-        let structured_result = structured_result.map(|value| self.redact_value(value));
-        let citations = content.iter().flat_map(find_citations).collect();
-        let remote_chat_id = remote_chat_id.map(|id| self.redact_text(&id));
-        if let Some(chat_id) = remote_chat_id.clone() {
+        if let Some(chat_id) = response.remote_chat_id.clone() {
             session.remote_chat_id = Some(chat_id);
         }
-        session.entries.push(SessionEntry {
-            timestamp_ms: timestamp_ms(),
-            kind: SessionEntryKind::Response {
-                content,
-                structured_result,
-                citations,
-                remote_chat_id,
-            },
-        });
-        self.save(session)
+        self.append(session, SessionEntryKind::Response(response))
     }
-
+    pub fn append_error(&self, session: &mut Session, message: String) -> Result<(), HistoryError> {
+        self.append(session, SessionEntryKind::Error { message })
+    }
     pub fn complete(&self, session: &mut Session) -> Result<(), HistoryError> {
         session.status = SessionStatus::Completed;
         self.save(session)
     }
-
     pub fn list(&self) -> Result<Vec<Session>, HistoryError> {
         if !self.directory.exists() {
-            return Ok(Vec::new());
+            return Ok(vec![]);
         }
-        let mut sessions = Vec::new();
-        for entry in fs::read_dir(&self.directory).map_err(|_| HistoryError::Read {
-            path: self.directory.clone(),
-        })? {
-            let path = entry
-                .map_err(|_| HistoryError::Read {
+        let mut sessions = fs::read_dir(&self.directory)
+            .map_err(|_| HistoryError::Read {
+                path: self.directory.clone(),
+            })?
+            .map(|entry| {
+                entry.map_err(|_| HistoryError::Read {
                     path: self.directory.clone(),
-                })?
-                .path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                sessions.push(load_file(&path)?);
-            }
-        }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .map(|path| load_file(&path))
+            .collect::<Result<Vec<_>, _>>()?;
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
         Ok(sessions)
     }
-
     pub fn load(&self, id: &str) -> Result<Session, HistoryError> {
-        load_file(&self.path_for(id)).map_err(|error| match error {
-            HistoryError::Read { .. } => HistoryError::NotFound { id: id.to_owned() },
+        let id = SessionId::parse(id)?;
+        load_file(&self.path_for(&id)).map_err(|error| match error {
+            HistoryError::Read { .. } => HistoryError::NotFound { id: id.to_string() },
             other => other,
         })
     }
-
+    fn append(&self, session: &mut Session, kind: SessionEntryKind) -> Result<(), HistoryError> {
+        session.entries.push(SessionEntry {
+            timestamp_ms: timestamp_ms(),
+            kind,
+        });
+        self.save(session)
+    }
     fn save(&self, session: &mut Session) -> Result<(), HistoryError> {
         fs::create_dir_all(&self.directory).map_err(|_| HistoryError::CreateDirectory {
             path: self.directory.clone(),
@@ -224,56 +242,8 @@ impl SessionHistory {
             .map_err(|_| HistoryError::Write { path: path.clone() })?;
         fs::rename(&temporary, &path).map_err(|_| HistoryError::Write { path })
     }
-
-    fn path_for(&self, id: &str) -> PathBuf {
+    fn path_for(&self, id: &SessionId) -> PathBuf {
         self.directory.join(format!("{id}.json"))
-    }
-
-    fn redact_text(&self, text: &str) -> String {
-        let without_token = if self.token.is_empty() {
-            text.to_owned()
-        } else {
-            text.replace(&self.token, "[redacted credential]")
-        };
-        redact_bearer(&without_token)
-    }
-
-    fn redact_value(&self, value: Value) -> Value {
-        match value {
-            Value::Object(values) => Value::Object(
-                values
-                    .into_iter()
-                    .map(|(key, value)| {
-                        let sensitive = [
-                            "token",
-                            "authorization",
-                            "credential",
-                            "secret",
-                            "password",
-                            "api_key",
-                        ]
-                        .iter()
-                        .any(|term| key.to_ascii_lowercase().contains(term));
-                        (
-                            key,
-                            if sensitive {
-                                Value::String("[redacted]".into())
-                            } else {
-                                self.redact_value(value)
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
-            Value::Array(values) => Value::Array(
-                values
-                    .into_iter()
-                    .map(|value| self.redact_value(value))
-                    .collect(),
-            ),
-            Value::String(text) => Value::String(self.redact_text(&text)),
-            other => other,
-        }
     }
 }
 
@@ -285,41 +255,6 @@ fn load_file(path: &Path) -> Result<Session, HistoryError> {
         path: path.to_path_buf(),
     })
 }
-
-fn find_citations(value: &Value) -> Vec<Value> {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .flat_map(|(key, value)| {
-                let mut found = if key.to_ascii_lowercase().contains("citation") {
-                    vec![value.clone()]
-                } else {
-                    Vec::new()
-                };
-                found.extend(find_citations(value));
-                found
-            })
-            .collect(),
-        Value::Array(values) => values.iter().flat_map(find_citations).collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn redact_bearer(text: &str) -> String {
-    let mut words = text.split_whitespace();
-    let mut output = String::new();
-    while let Some(word) = words.next() {
-        if !output.is_empty() {
-            output.push(' ');
-        }
-        output.push_str(word);
-        if word.eq_ignore_ascii_case("bearer") && words.next().is_some() {
-            output.push_str(" [redacted]");
-        }
-    }
-    output
-}
-
 fn timestamp_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -334,61 +269,68 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("adapt-tui-history-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
-        (
-            SessionHistory::at(&directory, "very-secret-token"),
-            directory,
-        )
+        (SessionHistory::at(&directory), directory)
     }
     #[test]
     fn snapshots_round_trip_and_active_sessions_are_recoverable() {
         let (history, directory) = history("round-trip");
         let mut session = history.create().unwrap();
         history
-            .append_prompt(&mut session, "Bearer very-secret-token show citation")
+            .append_prompt(&mut session, "prompt".into())
             .unwrap();
         history
             .append_response(
                 &mut session,
-                vec![serde_json::json!({"text":"ok", "citation":"guide", "authorization":"nope"})],
-                Some(serde_json::json!({"answer": 1, "secret": "nope"})),
-                Some("chat-1".into()),
+                TranscriptResponse {
+                    text_blocks: vec![TextBlock { text: "ok".into() }],
+                    structured_result: Some(serde_json::json!({"answer": 1})),
+                    citations: vec![Citation {
+                        value: serde_json::json!("guide"),
+                    }],
+                    remote_chat_id: Some("chat-1".into()),
+                },
             )
             .unwrap();
-        let loaded = history.load(&session.id).unwrap();
+        history.append_error(&mut session, "failed".into()).unwrap();
+        let loaded = history.load(&session.id.to_string()).unwrap();
         assert_eq!(loaded.status, SessionStatus::Active);
+        assert_eq!(loaded.entries.len(), 3);
         assert_eq!(loaded.remote_chat_id.as_deref(), Some("chat-1"));
-        assert_eq!(loaded.entries.len(), 2);
-        assert!(loaded.entries[1].timestamp_ms > 0);
-        let file = fs::read_to_string(history.path_for(&session.id)).unwrap();
-        assert!(!file.contains("very-secret-token"));
-        assert!(!file.contains("Bearer very-secret-token"));
-        assert!(!file.contains("\"nope\""));
-        assert!(file.contains("citation"));
         history.complete(&mut session).unwrap();
         assert_eq!(
-            history.load(&session.id).unwrap().status,
+            history.load(&session.id.to_string()).unwrap().status,
             SessionStatus::Completed
         );
         let _ = fs::remove_dir_all(directory);
     }
-
+    #[test]
+    fn invalid_ids_cannot_escape_the_sessions_directory() {
+        let (history, directory) = history("invalid-id");
+        for id in ["../secret", "/tmp/other", "valid/other", "not-a-session"] {
+            assert!(matches!(
+                history.load(id),
+                Err(HistoryError::InvalidId { .. })
+            ));
+        }
+        let _ = fs::remove_dir_all(directory);
+    }
     #[test]
     fn continuation_sessions_retain_their_origin_and_remote_chat_id() {
         let (history, directory) = history("continuation");
+        let origin = SessionId::parse("1-2-3").unwrap();
         let session = history
-            .create_continuation(Some("previous-session"), Some("chat-123"))
+            .create_continuation(Some(origin.clone()), Some("chat-123".into()))
             .unwrap();
-        let loaded = history.load(&session.id).unwrap();
-        assert_eq!(
-            loaded.resumed_from_session_id.as_deref(),
-            Some("previous-session")
-        );
+        let loaded = history.load(&session.id.to_string()).unwrap();
+        assert_eq!(loaded.resumed_from_session_id, Some(origin));
         assert_eq!(loaded.remote_chat_id.as_deref(), Some("chat-123"));
         let _ = fs::remove_dir_all(directory);
     }
     #[test]
     fn uses_a_sessions_sibling_not_the_credential_file() {
-        let history = SessionHistory::for_credential_file("/tmp/.adapt/config.toml", "token");
-        assert_eq!(history.directory(), Path::new("/tmp/.adapt/sessions"));
+        assert_eq!(
+            SessionHistory::for_credential_file("/tmp/.adapt/config.toml").directory(),
+            Path::new("/tmp/.adapt/sessions")
+        );
     }
 }
