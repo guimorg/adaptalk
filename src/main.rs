@@ -68,6 +68,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         }
     };
 
+    let mut remote_chat_id = None;
     loop {
         let Some(prompt) = repl.read_prompt()? else {
             return Ok(());
@@ -77,12 +78,19 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         }
         repl.show_working()?;
         let result = if allow_unverified_ask_adapt {
-            client.query_ask_adapt(&prompt, true).await
+            client
+                .query_ask_adapt_in_conversation(&prompt, remote_chat_id.as_deref(), true)
+                .await
         } else {
             client.query_read_only(&prompt).await
         };
         match result {
-            Ok(response) => append_response(&mut repl, response)?,
+            Ok(response) => {
+                if let Some(chat_id) = response.chat_id.clone() {
+                    remote_chat_id = Some(chat_id);
+                }
+                append_response(&mut repl, response)?;
+            }
             Err(error) => repl.show_error(&error.to_string())?,
         }
     }

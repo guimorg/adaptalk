@@ -151,6 +151,20 @@ impl AdaptClient {
         prompt: &str,
         allow_unverified: bool,
     ) -> Result<QueryResponse, AdaptClientError> {
+        self.query_ask_adapt_in_conversation(prompt, None, allow_unverified)
+            .await
+    }
+
+    /// Invoke `ask_adapt` with a previously returned Adapt chat identifier.
+    ///
+    /// The combined `message` and `chat_id` request is an experimental
+    /// development-only probe of Adapt's remote continuation behavior.
+    pub async fn query_ask_adapt_in_conversation(
+        &self,
+        prompt: &str,
+        chat_id: Option<&str>,
+        allow_unverified: bool,
+    ) -> Result<QueryResponse, AdaptClientError> {
         ensure_ask_adapt_opt_in(allow_unverified)?;
 
         let tools = self.cached_tools().await?;
@@ -161,7 +175,8 @@ impl AdaptClient {
                 "ask_adapt".to_owned(),
             ));
         }
-        self.invoke_tool("ask_adapt", prompt).await
+        self.invoke_tool_with_chat_id("ask_adapt", prompt, chat_id)
+            .await
     }
 
     /// Submit a prompt through the only available verified read-only capability.
@@ -194,7 +209,17 @@ impl AdaptClient {
         capability: &str,
         prompt: &str,
     ) -> Result<QueryResponse, AdaptClientError> {
-        let arguments = tool_arguments(capability, prompt);
+        self.invoke_tool_with_chat_id(capability, prompt, None)
+            .await
+    }
+
+    async fn invoke_tool_with_chat_id(
+        &self,
+        capability: &str,
+        prompt: &str,
+        chat_id: Option<&str>,
+    ) -> Result<QueryResponse, AdaptClientError> {
+        let arguments = tool_arguments(capability, prompt, chat_id);
         let mut result: CallToolResult = self
             .service
             .peer()
@@ -241,16 +266,20 @@ fn extract_chat_id(content: &mut [rmcp::model::Content]) -> Option<String> {
     None
 }
 
-fn tool_arguments(capability: &str, prompt: &str) -> Map<String, Value> {
+fn tool_arguments(capability: &str, prompt: &str, chat_id: Option<&str>) -> Map<String, Value> {
     let mut arguments = Map::new();
     let parameter = match capability {
-        // `ask_adapt` starts a conversation from a `message`. `chat_id` is for
-        // reading an existing conversation, which is not part of this terminal
-        // submission flow.
+        // The interactive development REPL can also attach the last returned
+        // chat_id to test whether Adapt supports remote continuation.
         "ask_adapt" => "message",
         _ => "prompt",
     };
     arguments.insert(parameter.to_owned(), Value::String(prompt.to_owned()));
+    if capability == "ask_adapt"
+        && let Some(chat_id) = chat_id
+    {
+        arguments.insert("chat_id".to_owned(), Value::String(chat_id.to_owned()));
+    }
     arguments
 }
 
@@ -453,11 +482,22 @@ mod tests {
     #[test]
     fn ask_adapt_submits_the_chat_message_field() {
         assert_eq!(
-            tool_arguments("ask_adapt", "Hey, Adapt!"),
+            tool_arguments("ask_adapt", "Hey, Adapt!", None),
             Map::from_iter([(
                 "message".to_owned(),
                 Value::String("Hey, Adapt!".to_owned()),
             )])
+        );
+    }
+
+    #[test]
+    fn ask_adapt_can_include_a_previous_chat_id_for_continuation_testing() {
+        assert_eq!(
+            tool_arguments("ask_adapt", "Follow up", Some("chat-123")),
+            Map::from_iter([
+                ("message".to_owned(), Value::String("Follow up".to_owned())),
+                ("chat_id".to_owned(), Value::String("chat-123".to_owned())),
+            ])
         );
     }
 
