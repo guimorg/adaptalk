@@ -246,11 +246,14 @@ impl SessionHistory {
         })
     }
     /// Resolve continuation from this session's responses, then its immutable lineage.
+    ///
+    /// A session with any response owns its continuation state, including a response
+    /// whose remote chat ID is absent. Only an empty child inherits its origin's ID.
     pub fn latest_remote_chat_id(&self, session: &Session) -> Result<Option<String>, HistoryError> {
         let mut current = session.clone();
         loop {
-            if let Some(chat_id) = current.latest_remote_chat_id() {
-                return Ok(Some(chat_id.to_owned()));
+            if let Some(chat_id) = current.latest_response_remote_chat_id() {
+                return Ok(chat_id.map(str::to_owned));
             }
             let Some(origin) = current.resumed_from_session_id else {
                 return Ok(None);
@@ -291,6 +294,17 @@ impl Session {
             .rev()
             .find_map(|entry| match &entry.kind {
                 SessionEntryKind::Response(response) => response.remote_chat_id.as_deref(),
+                _ => None,
+            })
+    }
+
+    /// `Some(None)` means this session has responded but did not provide a chat ID.
+    fn latest_response_remote_chat_id(&self) -> Option<Option<&str>> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                SessionEntryKind::Response(response) => Some(response.remote_chat_id.as_deref()),
                 _ => None,
             })
     }
@@ -390,6 +404,34 @@ mod tests {
             history.latest_remote_chat_id(&continuation).unwrap(),
             Some("chat-1".into())
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+    #[test]
+    fn response_without_a_chat_id_does_not_fall_back_to_the_origin() {
+        let (history, directory) = history("continuation-empty-chat-id");
+        let mut origin = history.create().unwrap();
+        history
+            .append_response(
+                &mut origin,
+                RedactedTranscriptResponse::new(TranscriptResponse {
+                    text_blocks: vec![],
+                    structured_result: None,
+                    remote_chat_id: Some("chat-1".into()),
+                }),
+            )
+            .unwrap();
+        let mut continuation = history.create_continuation(Some(origin.id)).unwrap();
+        history
+            .append_response(
+                &mut continuation,
+                RedactedTranscriptResponse::new(TranscriptResponse {
+                    text_blocks: vec![],
+                    structured_result: None,
+                    remote_chat_id: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(history.latest_remote_chat_id(&continuation).unwrap(), None);
         let _ = fs::remove_dir_all(directory);
     }
     #[test]
