@@ -76,7 +76,7 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<AdaptConfig, ConfigError> {
     let endpoint = parsed
         .endpoint
         .unwrap_or_else(|| DEFAULT_ADAPT_ENDPOINT.to_owned());
-    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+    if !endpoint.starts_with("https://") {
         return Err(ConfigError::InvalidEndpoint { path });
     }
     Ok(AdaptConfig {
@@ -130,6 +130,17 @@ mod tests {
         assert!(matches!(
             load_from(&p),
             Err(ConfigError::MissingToken { .. })
+        ));
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn rejects_insecure_endpoint() {
+        let p = path("insecure-endpoint");
+        fs::write(&p, "bearer_token='s'\nendpoint='http://localhost/mcp'").unwrap();
+        assert!(matches!(
+            load_from(&p),
+            Err(ConfigError::InvalidEndpoint { .. })
         ));
         let _ = fs::remove_file(p);
     }
