@@ -1,7 +1,6 @@
 //! Secret-safe, local-only Adapt conversation snapshots.
 //!
-//! This module owns file lifecycle only. Callers must pass display-oriented,
-//! already-redacted entries through the application redaction boundary.
+//! This module owns file lifecycle and accepts only redacted transcript data.
 
 use std::{
     fmt, fs,
@@ -11,7 +10,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -79,16 +77,39 @@ pub struct TextBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Citation {
-    pub value: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptResponse {
     pub text_blocks: Vec<TextBlock>,
-    pub structured_result: Option<Value>,
-    pub citations: Vec<Citation>,
+    /// A deliberately opaque, already-redacted result for inline display.
+    pub structured_result: Option<serde_json::Value>,
     pub remote_chat_id: Option<String>,
+}
+
+/// Data that has passed through the application redaction boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedactedText(String);
+
+impl RedactedText {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// A display response that has passed through the application redaction boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedactedTranscriptResponse(TranscriptResponse);
+
+impl RedactedTranscriptResponse {
+    pub(crate) fn new(value: TranscriptResponse) -> Self {
+        Self(value)
+    }
+
+    pub fn as_inner(&self) -> &TranscriptResponse {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> TranscriptResponse {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,7 +126,6 @@ pub struct Session {
     pub started_at_ms: u128,
     pub updated_at_ms: u128,
     pub status: SessionStatus,
-    pub remote_chat_id: Option<String>,
     #[serde(default)]
     pub resumed_from_session_id: Option<SessionId>,
     pub entries: Vec<SessionEntry>,
@@ -150,12 +170,11 @@ impl SessionHistory {
         &self.directory
     }
     pub fn create(&self) -> Result<Session, HistoryError> {
-        self.create_continuation(None, None)
+        self.create_continuation(None)
     }
     pub fn create_continuation(
         &self,
         resumed_from_session_id: Option<SessionId>,
-        remote_chat_id: Option<String>,
     ) -> Result<Session, HistoryError> {
         let now = timestamp_ms();
         let mut session = Session {
@@ -163,28 +182,32 @@ impl SessionHistory {
             started_at_ms: now,
             updated_at_ms: now,
             status: SessionStatus::Active,
-            remote_chat_id,
             resumed_from_session_id,
             entries: vec![],
         };
         self.save(&mut session)?;
         Ok(session)
     }
-    pub fn append_prompt(&self, session: &mut Session, text: String) -> Result<(), HistoryError> {
-        self.append(session, SessionEntryKind::Prompt { text })
+    pub fn append_prompt(
+        &self,
+        session: &mut Session,
+        text: RedactedText,
+    ) -> Result<(), HistoryError> {
+        self.append(session, SessionEntryKind::Prompt { text: text.0 })
     }
     pub fn append_response(
         &self,
         session: &mut Session,
-        response: TranscriptResponse,
+        response: RedactedTranscriptResponse,
     ) -> Result<(), HistoryError> {
-        if let Some(chat_id) = response.remote_chat_id.clone() {
-            session.remote_chat_id = Some(chat_id);
-        }
-        self.append(session, SessionEntryKind::Response(response))
+        self.append(session, SessionEntryKind::Response(response.0))
     }
-    pub fn append_error(&self, session: &mut Session, message: String) -> Result<(), HistoryError> {
-        self.append(session, SessionEntryKind::Error { message })
+    pub fn append_error(
+        &self,
+        session: &mut Session,
+        message: RedactedText,
+    ) -> Result<(), HistoryError> {
+        self.append(session, SessionEntryKind::Error { message: message.0 })
     }
     pub fn complete(&self, session: &mut Session) -> Result<(), HistoryError> {
         session.status = SessionStatus::Completed;
@@ -247,6 +270,19 @@ impl SessionHistory {
     }
 }
 
+impl Session {
+    /// The latest response is the single source of truth for remote continuation.
+    pub fn latest_remote_chat_id(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                SessionEntryKind::Response(response) => response.remote_chat_id.as_deref(),
+                _ => None,
+            })
+    }
+}
+
 fn load_file(path: &Path) -> Result<Session, HistoryError> {
     let text = fs::read_to_string(path).map_err(|_| HistoryError::Read {
         path: path.to_path_buf(),
@@ -276,26 +312,25 @@ mod tests {
         let (history, directory) = history("round-trip");
         let mut session = history.create().unwrap();
         history
-            .append_prompt(&mut session, "prompt".into())
+            .append_prompt(&mut session, RedactedText::new("prompt".into()))
             .unwrap();
         history
             .append_response(
                 &mut session,
-                TranscriptResponse {
+                RedactedTranscriptResponse::new(TranscriptResponse {
                     text_blocks: vec![TextBlock { text: "ok".into() }],
                     structured_result: Some(serde_json::json!({"answer": 1})),
-                    citations: vec![Citation {
-                        value: serde_json::json!("guide"),
-                    }],
                     remote_chat_id: Some("chat-1".into()),
-                },
+                }),
             )
             .unwrap();
-        history.append_error(&mut session, "failed".into()).unwrap();
+        history
+            .append_error(&mut session, RedactedText::new("failed".into()))
+            .unwrap();
         let loaded = history.load(&session.id.to_string()).unwrap();
         assert_eq!(loaded.status, SessionStatus::Active);
         assert_eq!(loaded.entries.len(), 3);
-        assert_eq!(loaded.remote_chat_id.as_deref(), Some("chat-1"));
+        assert_eq!(loaded.latest_remote_chat_id(), Some("chat-1"));
         history.complete(&mut session).unwrap();
         assert_eq!(
             history.load(&session.id.to_string()).unwrap().status,
@@ -315,15 +350,12 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
     #[test]
-    fn continuation_sessions_retain_their_origin_and_remote_chat_id() {
+    fn continuation_sessions_retain_their_origin() {
         let (history, directory) = history("continuation");
         let origin = SessionId::parse("1-2-3").unwrap();
-        let session = history
-            .create_continuation(Some(origin.clone()), Some("chat-123".into()))
-            .unwrap();
+        let session = history.create_continuation(Some(origin.clone())).unwrap();
         let loaded = history.load(&session.id.to_string()).unwrap();
         assert_eq!(loaded.resumed_from_session_id, Some(origin));
-        assert_eq!(loaded.remote_chat_id.as_deref(), Some("chat-123"));
         let _ = fs::remove_dir_all(directory);
     }
     #[test]

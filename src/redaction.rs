@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::session_history::{RedactedText, RedactedTranscriptResponse, TranscriptResponse};
+
 #[derive(Debug, Clone, Default)]
 pub struct Redactor {
     configured_token: String,
@@ -56,6 +58,24 @@ impl Redactor {
             Value::String(text) => Value::String(self.text(&text)),
             other => other,
         }
+    }
+
+    pub fn transcript_text(&self, text: &str) -> RedactedText {
+        RedactedText::new(self.text(text))
+    }
+
+    pub fn transcript_response(&self, response: TranscriptResponse) -> RedactedTranscriptResponse {
+        RedactedTranscriptResponse::new(TranscriptResponse {
+            text_blocks: response
+                .text_blocks
+                .into_iter()
+                .map(|block| crate::session_history::TextBlock {
+                    text: self.text(&block.text),
+                })
+                .collect(),
+            structured_result: response.structured_result.map(|value| self.value(value)),
+            remote_chat_id: response.remote_chat_id.map(|id| self.text(&id)),
+        })
     }
 }
 

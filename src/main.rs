@@ -1,16 +1,16 @@
 use adapt_tui::{
-    adapt_client::{AdaptClient, QueryResponse},
+    adapt_client::AdaptClient,
     chat_terminal::{Repl, ReplCommand, parse_command},
     config,
-    redaction::Redactor,
-    session_history::{
-        Citation, Session, SessionEntryKind, SessionHistory, TextBlock, TranscriptResponse,
+    conversation_controller::{
+        Connection, ConversationController, ConversationQuery, QueryFuture, RenderIntent,
     },
+    redaction::Redactor,
+    session_history::{Session, SessionEntryKind, SessionHistory, TranscriptResponse},
+    transcript,
 };
 use anyhow::Result;
 use clap::Parser;
-use rmcp::model::RawContent;
-use serde_json::Value;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
@@ -28,154 +28,43 @@ struct Cli {
     prompt: Vec<String>,
 }
 
-enum TerminalState {
-    Disconnected,
-    Connected(Box<ActiveConversation>),
-    ViewingHistory(ResumeTarget),
-}
-
-struct ActiveConversation {
+struct TerminalQuery {
     client: AdaptClient,
-    history: SessionHistory,
-    session: Session,
-    remote_chat_id: Option<String>,
-}
-
-struct ResumeTarget {
-    session: Session,
-}
-
-struct ConversationController {
-    state: TerminalState,
-    offline_history: SessionHistory,
     redactor: Redactor,
     allow_unverified_ask_adapt: bool,
 }
 
-impl ConversationController {
-    fn new(offline_history: SessionHistory, allow_unverified_ask_adapt: bool) -> Self {
-        Self {
-            state: TerminalState::Disconnected,
-            offline_history,
-            redactor: Redactor::default(),
-            allow_unverified_ask_adapt,
-        }
+impl ConversationQuery for TerminalQuery {
+    fn query<'a>(&'a self, prompt: &'a str, continuation: Option<&'a str>) -> QueryFuture<'a> {
+        Box::pin(async move {
+            let response = if self.allow_unverified_ask_adapt {
+                self.client
+                    .query_ask_adapt_in_conversation(prompt, continuation, true)
+                    .await?
+            } else {
+                self.client.query_read_only(prompt).await?
+            };
+            Ok(self
+                .redactor
+                .transcript_response(transcript::from_query_response(response)?))
+        })
     }
-    fn history(&self) -> &SessionHistory {
-        &self.offline_history
-    }
-    fn redactor(&self) -> Redactor {
-        self.redactor.clone()
-    }
-    fn finish(&mut self) -> Result<()> {
-        if let TerminalState::Connected(active) = &mut self.state {
-            active.history.complete(&mut active.session)?;
-        }
-        Ok(())
-    }
-    fn open(&mut self, opened: Session) -> Result<()> {
-        self.finish()?;
-        self.state = TerminalState::ViewingHistory(ResumeTarget { session: opened });
-        Ok(())
-    }
-    fn opened_session(&self) -> Option<&Session> {
-        match &self.state {
-            TerminalState::ViewingHistory(target) => Some(&target.session),
-            _ => None,
-        }
-    }
-    async fn submit(&mut self, prompt: &str) -> Result<TranscriptResponse> {
-        self.connect_for_prompt().await?;
-        let TerminalState::Connected(active) = &mut self.state else {
-            unreachable!("connect_for_prompt always enters Connected")
-        };
-        active
-            .history
-            .append_prompt(&mut active.session, self.redactor.text(prompt))?;
-        let result = if self.allow_unverified_ask_adapt {
-            active
-                .client
-                .query_ask_adapt_in_conversation(prompt, active.remote_chat_id.as_deref(), true)
-                .await
-        } else {
-            active.client.query_read_only(prompt).await
-        };
-        match result {
-            Ok(response) => {
-                let response = transcript_response(response, &self.redactor)?;
-                if let Some(chat_id) = response.remote_chat_id.clone() {
-                    active.remote_chat_id = Some(chat_id);
-                }
-                active
-                    .history
-                    .append_response(&mut active.session, response.clone())?;
-                Ok(response)
-            }
-            Err(error) => {
-                let message = self.redactor.text(&error.to_string());
-                active
-                    .history
-                    .append_error(&mut active.session, message.clone())?;
-                Err(error.into())
-            }
-        }
-    }
-    async fn connect_for_prompt(&mut self) -> Result<()> {
-        let target = match std::mem::replace(&mut self.state, TerminalState::Disconnected) {
-            TerminalState::Connected(active) => {
-                self.state = TerminalState::Connected(active);
-                return Ok(());
-            }
-            TerminalState::ViewingHistory(target) => Some(target),
-            TerminalState::Disconnected => None,
-        };
-        let connection = async {
-            let config = config::load()?;
-            let client = AdaptClient::connect(&config).await?;
-            client.discover_capabilities().await?;
-            Ok::<_, anyhow::Error>((config, client))
-        }
-        .await;
-        let (config, client) = match connection {
-            Ok(connection) => connection,
-            Err(error) => {
-                self.state = target
-                    .map(TerminalState::ViewingHistory)
-                    .unwrap_or(TerminalState::Disconnected);
-                return Err(error);
-            }
-        };
-        self.redactor = Redactor::new(&config.bearer_token);
-        let history = SessionHistory::for_credential_file(&config.source);
-        let session = match target.as_ref() {
-            Some(target) => history.create_continuation(
-                Some(target.session.id.clone()),
-                if self.allow_unverified_ask_adapt {
-                    target
-                        .session
-                        .remote_chat_id
-                        .as_ref()
-                        .map(|id| self.redactor.text(id))
-                } else {
-                    None
-                },
-            )?,
-            None => history.create()?,
-        };
-        self.state = TerminalState::Connected(Box::new(ActiveConversation {
+}
+
+async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<Connection<TerminalQuery>> {
+    let config = config::load()?;
+    let client = AdaptClient::connect(&config).await?;
+    client.discover_capabilities().await?;
+    let redactor = Redactor::new(&config.bearer_token);
+    Ok(Connection {
+        query: TerminalQuery {
             client,
-            history,
-            session,
-            remote_chat_id: None,
-        }));
-        if let TerminalState::Connected(active) = &mut self.state
-            && self.allow_unverified_ask_adapt
-            && let Some(target) = target.as_ref()
-        {
-            active.remote_chat_id = target.session.remote_chat_id.clone();
-        }
-        Ok(())
-    }
+            redactor: redactor.clone(),
+            allow_unverified_ask_adapt,
+        },
+        history: SessionHistory::for_credential_file(&config.source),
+        redactor,
+    })
 }
 
 #[tokio::main]
@@ -203,7 +92,11 @@ async fn run_prompt(args: &Cli) -> Result<()> {
     };
     println!(
         "response: {}",
-        serde_json::to_string_pretty(&transcript_response(response, &redactor)?)?
+        serde_json::to_string_pretty(
+            &redactor
+                .transcript_response(transcript::from_query_response(response)?)
+                .into_inner(),
+        )?
     );
     Ok(())
 }
@@ -211,7 +104,7 @@ async fn run_prompt(args: &Cli) -> Result<()> {
 async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut repl = Repl::start(allow_unverified_ask_adapt)?;
     let history = SessionHistory::for_credential_file(config::default_config_path()?);
-    let mut controller = ConversationController::new(history, allow_unverified_ask_adapt);
+    let mut controller = ConversationController::<TerminalQuery>::new(history);
     loop {
         let Some(prompt) = repl.read_prompt()? else {
             return controller.finish();
@@ -224,13 +117,10 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 ReplCommand::History => show_history(&mut repl, controller.history())?,
                 ReplCommand::Open(id) => {
                     if let Some(session) = load_history(&mut repl, controller.history(), &id)? {
-                        controller.open(session)?;
+                        let RenderIntent::ShowHistory(opened) = controller.open(session)?;
                         repl.clear_transcript()?;
-                        let opened = controller
-                            .opened_session()
-                            .expect("open transition retains the selected transcript");
-                        render_history(&mut repl, opened)?;
-                        if opened.remote_chat_id.is_none() {
+                        render_history(&mut repl, &opened)?;
+                        if opened.latest_remote_chat_id().is_none() {
                             repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
                         } else if !allow_unverified_ask_adapt {
                             repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
@@ -242,71 +132,19 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
             continue;
         }
         repl.show_working()?;
+        if controller.needs_connection() {
+            let connection = connect_terminal(allow_unverified_ask_adapt);
+            if let Err(error) = controller.connect_with(connection).await {
+                repl.show_error(&controller.redactor().text(&error.to_string()))?;
+                continue;
+            }
+        }
         let result = controller.submit(&prompt).await;
         repl.set_redactor(controller.redactor());
         match result {
             Ok(response) => render_response(&mut repl, response)?,
             Err(error) => repl.show_error(&controller.redactor().text(&error.to_string()))?,
         }
-    }
-}
-
-fn transcript_response(response: QueryResponse, redactor: &Redactor) -> Result<TranscriptResponse> {
-    let mut citations = Vec::new();
-    let content = response
-        .content
-        .into_iter()
-        .map(|content| {
-            citations.extend(find_citations(&serde_json::to_value(&content)?));
-            match content.raw {
-                RawContent::Text(text) => Ok(TextBlock {
-                    text: redactor.text(&text.text),
-                }),
-                _ => Ok(TextBlock {
-                    text: redactor.text(&serde_json::to_string(&content)?),
-                }),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let structured_result = response
-        .structured_content
-        .map(|value| redactor.value(value));
-    citations.extend(
-        structured_result
-            .as_ref()
-            .into_iter()
-            .flat_map(find_citations),
-    );
-    let citations = citations
-        .into_iter()
-        .map(|value| Citation {
-            value: redactor.value(value),
-        })
-        .collect();
-    Ok(TranscriptResponse {
-        text_blocks: content,
-        structured_result,
-        citations,
-        remote_chat_id: response.chat_id.map(|id| redactor.text(&id)),
-    })
-}
-
-fn find_citations(value: &Value) -> Vec<Value> {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .flat_map(|(key, value)| {
-                let mut found = if key.to_ascii_lowercase().contains("citation") {
-                    vec![value.clone()]
-                } else {
-                    vec![]
-                };
-                found.extend(find_citations(value));
-                found
-            })
-            .collect(),
-        Value::Array(values) => values.iter().flat_map(find_citations).collect(),
-        _ => vec![],
     }
 }
 
@@ -373,8 +211,8 @@ fn compact(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, transcript_response};
-    use adapt_tui::{adapt_client::QueryResponse, redaction::Redactor};
+    use super::Cli;
+    use adapt_tui::{adapt_client::QueryResponse, redaction::Redactor, transcript};
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use rmcp::model::{Content, RawContent};
     #[test]
@@ -440,7 +278,9 @@ mod tests {
             structured_content: Some(serde_json::json!({"token": "top-secret"})),
             chat_id: None,
         };
-        let transcript = transcript_response(response, &Redactor::new("top-secret")).unwrap();
+        let transcript = Redactor::new("top-secret")
+            .transcript_response(transcript::from_query_response(response).unwrap())
+            .into_inner();
         let stored = serde_json::to_string(&transcript).unwrap();
         assert!(!stored.contains("top-secret"));
     }

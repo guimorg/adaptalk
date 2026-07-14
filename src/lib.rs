@@ -1,5 +1,7 @@
 pub mod adapt_client;
 pub mod chat_terminal;
 pub mod config;
+pub mod conversation_controller;
 pub mod redaction;
 pub mod session_history;
+pub mod transcript;
