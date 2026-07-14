@@ -1,0 +1,6 @@
+/target/
+/.direnv/
+/.devenv/
+.adapt/config.toml
+.adapt/sessions/
+
