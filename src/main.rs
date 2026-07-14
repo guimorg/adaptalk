@@ -1,7 +1,16 @@
+use adapt_tui::{adapt_client::AdaptClient, config};
 use anyhow::Result;
 
-fn main() -> Result<()> {
-    println!("adapt-tui — Adapt MCP client scaffold");
-    println!("Read-only Chat Terminal coming next.");
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = config::load()?;
+    println!("configuration: {}", config.source.display());
+    let client = AdaptClient::connect(&config).await?;
+    println!("connection: connected and initialized");
+    let capabilities = client.discover_capabilities().await?;
+    println!("safe capabilities: {}", capabilities.len());
+    for capability in capabilities {
+        println!("- {}", capability.name);
+    }
     Ok(())
 }
