@@ -78,10 +78,7 @@ impl ClientHandler for ClientHandlerImpl {}
 
 impl AdaptClient {
     pub async fn connect(config: &AdaptConfig) -> Result<Self, AdaptClientError> {
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone())
-                .auth_header(format!("Bearer {}", config.bearer_token)),
-        );
+        let transport = StreamableHttpClientTransport::from_config(transport_config(config));
         let service = ClientHandlerImpl
             .serve(transport)
             .await
@@ -108,6 +105,12 @@ impl AdaptClient {
             }),
         }))
     }
+}
+
+fn transport_config(config: &AdaptConfig) -> StreamableHttpClientTransportConfig {
+    StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone())
+        // RMCP adds the `Bearer ` prefix; this value must be the raw session token.
+        .auth_header(config.bearer_token.clone())
 }
 
 fn map_transport_error(error: impl std::fmt::Display, credential: &str) -> AdaptClientError {
@@ -194,5 +197,18 @@ mod tests {
             map_transport_error("server returned status code: 403", ""),
             AdaptClientError::AuthenticationRejected
         ));
+    }
+
+    #[test]
+    fn transport_config_passes_raw_token_to_rmcp() {
+        let config = AdaptConfig {
+            bearer_token: "session-token".into(),
+            endpoint: "https://app.adapt.com/mcp".into(),
+            source: "/tmp/config.toml".into(),
+        };
+        assert_eq!(
+            transport_config(&config).auth_header.as_deref(),
+            Some("session-token")
+        );
     }
 }
