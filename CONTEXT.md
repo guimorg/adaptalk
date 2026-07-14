@@ -24,8 +24,8 @@ _Avoid_: Slack thread, MCP connection
 One natural-language request submitted by the user within an Adapt Session.
 _Avoid_: Tool command, MCP request
 
-**Chat Terminal**:
-The minimal AdaptTUI interaction surface: a scrollable conversation transcript and a prompt input, with structured read-only results shown inline.
+**Terminal REPL**:
+The minimal AdaptTUI interaction surface: a line-oriented prompt and colored conversation output preserved in native terminal scrollback, with structured read-only results shown inline.
 _Avoid_: Dashboard, tool browser
 
 **Action Approval**:

@@ -1,13 +1,13 @@
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, CallToolResult},
+    model::{CallToolRequestParams, CallToolResult, RawContent},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::future::Future;
+use std::{future::Future, time::Duration};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
@@ -23,6 +23,7 @@ pub struct Capability {
 pub struct QueryResponse {
     pub content: Vec<rmcp::model::Content>,
     pub structured_content: Option<Value>,
+    pub chat_id: Option<String>,
 }
 
 // Keep this list empty until Adapt documents and verifies a non-mutating
@@ -32,14 +33,16 @@ const VERIFIED_READ_ONLY_CAPABILITIES: &[&str] = &[];
 
 #[derive(Debug, Error)]
 pub enum AdaptClientError {
-    #[error("Adapt authentication was rejected by the server")]
+    #[error(
+        "Adapt authentication was rejected by the server; refresh bearer_token in ~/.adapt/config.toml and retry"
+    )]
     AuthenticationRejected,
     #[error("Adapt capability `{0}` is not verified as read-only")]
     CapabilityNotReadOnly(String),
     #[error("Adapt capability `ask_adapt` requires --allow-unverified-ask-adapt")]
     AskAdaptOptInRequired,
-    #[error("Adapt capability `{0}` returned an error")]
-    CapabilityFailed(String),
+    #[error("Adapt capability `{capability}` returned an error{detail}")]
+    CapabilityFailed { capability: String, detail: String },
     #[error("Adapt has no verified read-only capability available")]
     NoReadOnlyCapability,
     #[error("Adapt endpoint or transport failed: {0}")]
@@ -75,6 +78,7 @@ impl ClientHandler for ClientHandlerImpl {}
 
 impl AdaptClient {
     pub async fn connect(config: &AdaptConfig) -> Result<Self, AdaptClientError> {
+        validate_credentials(config).await?;
         let transport = StreamableHttpClientTransport::from_config(transport_config(config));
         let service = ClientHandlerImpl
             .serve(transport)
@@ -190,9 +194,8 @@ impl AdaptClient {
         capability: &str,
         prompt: &str,
     ) -> Result<QueryResponse, AdaptClientError> {
-        let mut arguments = Map::new();
-        arguments.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
-        let result: CallToolResult = self
+        let arguments = tool_arguments(capability, prompt);
+        let mut result: CallToolResult = self
             .service
             .peer()
             .call_tool(CallToolRequestParams {
@@ -204,13 +207,104 @@ impl AdaptClient {
             .await
             .map_err(|e| map_transport_error(e, &self.credential))?;
         if result.is_error == Some(true) {
-            return Err(AdaptClientError::CapabilityFailed(capability.to_owned()));
+            return Err(capability_failure(
+                capability,
+                &result.content,
+                &self.credential,
+            ));
         }
+        let chat_id = extract_chat_id(&mut result.content);
         Ok(QueryResponse {
             content: result.content,
             structured_content: result.structured_content,
+            chat_id,
         })
     }
+}
+
+fn extract_chat_id(content: &mut [rmcp::model::Content]) -> Option<String> {
+    for item in content {
+        let RawContent::Text(text) = &mut item.raw else {
+            continue;
+        };
+        let Some((header, body)) = text.text.split_once('\n') else {
+            continue;
+        };
+        let Some(chat_id) = header.strip_prefix("chat_id: ") else {
+            continue;
+        };
+        let chat_id = chat_id.to_owned();
+        let body = body.trim_start_matches('\n').to_owned();
+        text.text = body;
+        return Some(chat_id);
+    }
+    None
+}
+
+fn tool_arguments(capability: &str, prompt: &str) -> Map<String, Value> {
+    let mut arguments = Map::new();
+    let parameter = match capability {
+        // `ask_adapt` starts a conversation from a `message`. `chat_id` is for
+        // reading an existing conversation, which is not part of this terminal
+        // submission flow.
+        "ask_adapt" => "message",
+        _ => "prompt",
+    };
+    arguments.insert(parameter.to_owned(), Value::String(prompt.to_owned()));
+    arguments
+}
+
+fn capability_failure(
+    capability: &str,
+    content: &[rmcp::model::Content],
+    credential: &str,
+) -> AdaptClientError {
+    let message = content
+        .iter()
+        .filter_map(|content| match &content.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let detail = if message.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", sanitize_transport_error(&message, credential))
+    };
+    AdaptClientError::CapabilityFailed {
+        capability: capability.to_owned(),
+        detail,
+    }
+}
+
+/// Adapt returns a JSON error body without a `WWW-Authenticate` header for an
+/// invalid session. RMCP 0.16 then attempts to decode that body as JSON-RPC
+/// during initialization, hiding the actionable authentication failure. A
+/// lightweight authenticated GET lets us report the rejected credential first.
+async fn validate_credentials(config: &AdaptConfig) -> Result<(), AdaptClientError> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| map_transport_error(error, &config.bearer_token))?
+        .get(&config.endpoint)
+        .bearer_auth(&config.bearer_token)
+        .send()
+        .await
+        .map_err(|error| map_transport_error(error, &config.bearer_token))?;
+
+    if is_authentication_rejection(response.status()) {
+        Err(AdaptClientError::AuthenticationRejected)
+    } else {
+        Ok(())
+    }
+}
+
+fn is_authentication_rejection(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    )
 }
 
 fn is_verified_read_only(tool: &rmcp::model::Tool) -> bool {
@@ -300,6 +394,17 @@ mod tests {
     }
 
     #[test]
+    fn preflight_recognizes_headerless_authentication_rejections() {
+        assert!(is_authentication_rejection(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(is_authentication_rejection(reqwest::StatusCode::FORBIDDEN));
+        assert!(!is_authentication_rejection(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ));
+    }
+
+    #[test]
     fn transport_config_passes_raw_token_to_rmcp() {
         let config = AdaptConfig {
             bearer_token: "session-token".into(),
@@ -346,6 +451,31 @@ mod tests {
     }
 
     #[test]
+    fn ask_adapt_submits_the_chat_message_field() {
+        assert_eq!(
+            tool_arguments("ask_adapt", "Hey, Adapt!"),
+            Map::from_iter([(
+                "message".to_owned(),
+                Value::String("Hey, Adapt!".to_owned()),
+            )])
+        );
+    }
+
+    #[test]
+    fn chat_id_header_is_kept_as_metadata_not_visible_reply_text() {
+        let mut content = vec![rmcp::model::Content::new(
+            RawContent::text("chat_id: chat-123\n\nHello, Guilherme!"),
+            None,
+        )];
+
+        assert_eq!(extract_chat_id(&mut content).as_deref(), Some("chat-123"));
+        let RawContent::Text(text) = &content[0].raw else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.text, "Hello, Guilherme!");
+    }
+
+    #[test]
     fn arbitrary_unverified_capabilities_are_not_allowed_by_ask_adapt_policy() {
         assert!(!is_allowed_unverified_capability("other_tool"));
         assert!(is_allowed_unverified_capability("ask_adapt"));
@@ -356,6 +486,20 @@ mod tests {
         let error = ensure_ask_adapt_opt_in(false).unwrap_err().to_string();
         assert!(!error.contains("secret"));
         assert!(error.contains("--allow-unverified-ask-adapt"));
+    }
+
+    #[test]
+    fn capability_errors_preserve_text_without_leaking_the_credential() {
+        let content = vec![rmcp::model::Content::new(
+            RawContent::text("The session token super-secret-token has expired"),
+            None,
+        )];
+        let error = capability_failure("ask_adapt", &content, "super-secret-token");
+
+        let message = error.to_string();
+        assert!(message.contains("has expired"));
+        assert!(message.contains("[redacted credential]"));
+        assert!(!message.contains("super-secret-token"));
     }
 
     fn test_tool(name: &str) -> rmcp::model::Tool {

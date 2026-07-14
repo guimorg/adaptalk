@@ -9,14 +9,14 @@ license = "MIT"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-directories = "6"
-ratatui = "0.29"
+# Reuse RMCP's Rustls-configured HTTP client without enabling Reqwest's
+# unrelated default proxy, charset, and native-TLS features.
+reqwest = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 toml = "0.8"
-uuid = { version = "1", features = ["v4", "serde"] }
 
 # Keep the MCP boundary behind our own adapter until Adapt's hosted endpoint
 # contract is verified against the current RMCP transport APIs.

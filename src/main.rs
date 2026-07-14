@@ -1,11 +1,11 @@
 use adapt_tui::{
     adapt_client::{AdaptClient, QueryResponse},
-    chat_terminal::{ChatState, ClientEvent, TerminalSession, is_exit_key},
+    chat_terminal::Repl,
     config,
 };
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::KeyCode;
+use rmcp::model::RawContent;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 
@@ -28,9 +28,6 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
-    if args.allow_unverified_ask_adapt {
-        println!("{ASK_ADAPT_WARNING}");
-    }
     if !args.prompt.is_empty() {
         let config = config::load()?;
         let client = AdaptClient::connect(&config).await?;
@@ -41,6 +38,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_prompt(client: &AdaptClient, args: &Cli) -> Result<()> {
+    if args.allow_unverified_ask_adapt {
+        eprintln!("{ASK_ADAPT_WARNING}");
+    }
     let prompt = args.prompt.join(" ");
     let response = if args.allow_unverified_ask_adapt {
         client.query_ask_adapt(&prompt, true).await?
@@ -52,9 +52,7 @@ async fn run_prompt(client: &AdaptClient, args: &Cli) -> Result<()> {
 }
 
 async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
-    let mut terminal = TerminalSession::enter()?;
-    let mut state = ChatState::new();
-    terminal.draw(&state)?;
+    let mut repl = Repl::start(allow_unverified_ask_adapt)?;
     let client: Result<AdaptClient> = async {
         let config = config::load()?;
         let client = AdaptClient::connect(&config).await?;
@@ -63,78 +61,54 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     }
     .await;
     let client = match client {
-        Ok(client) => {
-            state.set_ready();
-            client
-        }
+        Ok(client) => client,
         Err(error) => {
-            state.apply(ClientEvent::Error(error.to_string()));
-            return wait_for_exit(&mut terminal, &state);
+            repl.show_error(&error.to_string())?;
+            return Ok(());
         }
     };
 
     loop {
-        terminal.draw(&state)?;
-        let Some(key) = terminal.next_key()? else {
-            continue;
+        let Some(prompt) = repl.read_prompt()? else {
+            return Ok(());
         };
-        if is_exit_key(key) {
-            return Ok(());
+        if prompt.is_empty() {
+            continue;
         }
-        match key.code {
-            KeyCode::Char(character) if key.modifiers.is_empty() => state.push_input(character),
-            KeyCode::Backspace => state.pop_input(),
-            KeyCode::Up => state.scroll_up(),
-            KeyCode::Down => state.scroll_down(),
-            KeyCode::Enter => {
-                let Some(prompt) = state.take_prompt() else {
-                    continue;
-                };
-                state.apply(ClientEvent::PromptSubmitted(prompt.clone()));
-                state.apply(ClientEvent::ResponseStarted);
-                terminal.draw(&state)?;
-                let result = if allow_unverified_ask_adapt {
-                    client.query_ask_adapt(&prompt, true).await
-                } else {
-                    client.query_read_only(&prompt).await
-                };
-                match result {
-                    Ok(response) => append_response(&mut state, response),
-                    Err(error) => state.apply(ClientEvent::Error(error.to_string())),
-                }
-            }
-            _ => {}
+        repl.show_working()?;
+        let result = if allow_unverified_ask_adapt {
+            client.query_ask_adapt(&prompt, true).await
+        } else {
+            client.query_read_only(&prompt).await
+        };
+        match result {
+            Ok(response) => append_response(&mut repl, response)?,
+            Err(error) => repl.show_error(&error.to_string())?,
         }
     }
 }
 
-fn wait_for_exit(terminal: &mut TerminalSession, state: &ChatState) -> Result<()> {
-    loop {
-        terminal.draw(state)?;
-        if let Some(key) = terminal.next_key()?
-            && is_exit_key(key)
-        {
-            return Ok(());
-        }
-    }
-}
-
-fn append_response(state: &mut ChatState, response: QueryResponse) {
+fn append_response(repl: &mut Repl, response: QueryResponse) -> std::io::Result<()> {
     for content in response.content {
-        let content = serde_json::to_string(&content)
-            .unwrap_or_else(|_| "[unrenderable response content]".to_owned());
-        state.apply(ClientEvent::ResponseChunk(content));
+        let content = match &content.raw {
+            RawContent::Text(text) => text.text.clone(),
+            _ => serde_json::to_string(&content)
+                .unwrap_or_else(|_| "[unrenderable response content]".to_owned()),
+        };
+        repl.show_adapt(&content)?;
     }
     if let Some(structured_content) = response.structured_content {
-        state.apply(ClientEvent::StructuredResult(structured_content));
+        repl.show_structured_result(structured_content)?;
     }
-    state.apply(ClientEvent::ResponseCompleted);
+    repl.finish_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::Cli;
+    use adapt_tui::{adapt_client::QueryResponse, chat_terminal::redact_text};
     use clap::{CommandFactory, Parser, error::ErrorKind};
+    use rmcp::model::{Content, RawContent};
 
     #[test]
     fn empty_arguments_do_not_submit_a_prompt() {
@@ -212,6 +186,24 @@ mod tests {
     fn warning_is_explicit_about_mutations() {
         assert!(super::ASK_ADAPT_WARNING.contains("not verified as read-only"));
         assert!(super::ASK_ADAPT_WARNING.contains("may perform mutations"));
+    }
+
+    #[test]
+    fn text_mcp_content_can_be_extracted_for_the_repl() {
+        let response = QueryResponse {
+            content: vec![Content::new(
+                RawContent::text("Hi Guilherme! What can I help with today?"),
+                None,
+            )],
+            structured_content: None,
+            chat_id: None,
+        };
+        let content = match &response.content[0].raw {
+            RawContent::Text(text) => text.text.clone(),
+            _ => unreachable!("test response contains text"),
+        };
+        assert_eq!(content, "Hi Guilherme! What can I help with today?");
+        assert_eq!(redact_text("Bearer secret"), "Bearer [redacted]");
     }
 
     #[test]

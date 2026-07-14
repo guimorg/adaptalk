@@ -1,235 +1,133 @@
-use std::{io, time::Duration};
+use std::io::{self, BufRead, Write};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    cursor::{MoveTo, MoveToColumn, MoveUp},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
-    text::{Line, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType},
 };
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClientEvent {
-    PromptSubmitted(String),
-    ResponseStarted,
-    ResponseChunk(String),
-    StructuredResult(Value),
-    ResponseCompleted,
-    Error(String),
+pub struct Repl {
+    stdout: io::Stdout,
+    waiting: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ConnectionStatus {
-    #[default]
-    Connecting,
-    Ready,
-    Loading,
-    Complete,
-    Error,
-}
-
-impl ConnectionStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Connecting => "Connecting",
-            Self::Ready => "Ready",
-            Self::Loading => "Loading…",
-            Self::Complete => "Complete",
-            Self::Error => "Error",
+impl Repl {
+    pub fn start(unverified_development_mode: bool) -> io::Result<Self> {
+        let mut repl = Self {
+            stdout: io::stdout(),
+            waiting: false,
+        };
+        execute!(repl.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        repl.write_plain("AdaptTUI · Read-only mode · Ctrl-C to exit\n")?;
+        if unverified_development_mode {
+            repl.write_colored(
+                "⚠ DEVELOPMENT MODE: ask_adapt is unverified and may perform mutations.\n",
+                Color::Yellow,
+            )?;
         }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct ChatState {
-    transcript: Vec<String>,
-    input: String,
-    status: ConnectionStatus,
-    scroll: u16,
-    pending_response: Option<usize>,
-}
-
-impl ChatState {
-    pub fn new() -> Self {
-        Self::default()
+        Ok(repl)
     }
 
-    pub fn apply(&mut self, event: ClientEvent) {
-        match event {
-            ClientEvent::PromptSubmitted(prompt) => {
-                self.transcript
-                    .push(format!("You: {}", redact_text(&prompt)));
-                self.input.clear();
-                self.status = ConnectionStatus::Loading;
-            }
-            ClientEvent::ResponseStarted => {
-                self.transcript.push("Adapt: ".to_owned());
-                self.pending_response = Some(self.transcript.len() - 1);
-                self.status = ConnectionStatus::Loading;
-            }
-            ClientEvent::ResponseChunk(chunk) => {
-                if let Some(index) = self.pending_response {
-                    self.transcript[index].push_str(&redact_text(&chunk));
-                } else {
-                    self.transcript
-                        .push(format!("Adapt: {}", redact_text(&chunk)));
-                }
-            }
-            ClientEvent::StructuredResult(value) => {
-                let value = redact_value(value);
-                let rendered = serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| "[unrenderable structured result]".to_owned());
-                self.transcript.push(format!("Result:\n{rendered}"));
-            }
-            ClientEvent::ResponseCompleted => {
-                self.pending_response = None;
-                self.status = ConnectionStatus::Complete;
-            }
-            ClientEvent::Error(message) => {
-                self.pending_response = None;
-                self.transcript
-                    .push(format!("Error: {}", redact_text(&message)));
-                self.status = ConnectionStatus::Error;
-            }
-        }
-    }
-
-    pub fn set_ready(&mut self) {
-        self.status = ConnectionStatus::Ready;
-    }
-
-    pub fn input(&self) -> &str {
-        &self.input
-    }
-
-    pub fn push_input(&mut self, character: char) {
-        self.input.push(character);
-    }
-
-    pub fn pop_input(&mut self) {
-        self.input.pop();
-    }
-
-    pub fn take_prompt(&mut self) -> Option<String> {
-        let prompt = self.input.trim().to_owned();
-        (!prompt.is_empty()).then_some(prompt)
-    }
-
-    pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
-    }
-
-    pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
-    }
-
-    pub fn transcript(&self) -> &[String] {
-        &self.transcript
-    }
-}
-
-pub struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-}
-
-impl TerminalSession {
-    pub fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout));
-        match terminal {
-            Ok(terminal) => Ok(Self { terminal }),
-            Err(error) => {
-                let _ = disable_raw_mode();
-                Err(error)
-            }
-        }
-    }
-
-    pub fn draw(&mut self, state: &ChatState) -> io::Result<()> {
-        self.terminal.draw(|frame| render(frame, state)).map(|_| ())
-    }
-
-    pub fn next_key(&mut self) -> io::Result<Option<KeyEvent>> {
-        if !event::poll(Duration::from_millis(250))? {
+    pub fn read_prompt(&mut self) -> io::Result<Option<String>> {
+        self.write_label("You", Color::Cyan)?;
+        self.write_plain(" › ")?;
+        let mut input = String::new();
+        let read = io::stdin().lock().read_line(&mut input)?;
+        if read == 0 {
+            self.write_plain("\n")?;
             return Ok(None);
         }
-        match event::read()? {
-            Event::Key(key) => Ok(Some(key)),
-            _ => Ok(None),
+        Ok(Some(input.trim().to_owned()))
+    }
+
+    pub fn show_working(&mut self) -> io::Result<()> {
+        self.write_label("Adapt", Color::Yellow)?;
+        self.write_plain(": is working…\n")?;
+        self.waiting = true;
+        Ok(())
+    }
+
+    pub fn show_adapt(&mut self, message: &str) -> io::Result<()> {
+        self.clear_working()?;
+        self.write_message("Adapt", Color::Magenta, &redact_text(message))
+    }
+
+    pub fn show_structured_result(&mut self, value: Value) -> io::Result<()> {
+        self.clear_working()?;
+        let rendered = serde_json::to_string_pretty(&redact_value(value))
+            .unwrap_or_else(|_| "[unrenderable structured result]".to_owned());
+        self.write_message("Result", Color::Blue, &rendered)
+    }
+
+    pub fn finish_response(&mut self) -> io::Result<()> {
+        self.clear_working()
+    }
+
+    pub fn show_error(&mut self, message: &str) -> io::Result<()> {
+        self.clear_working()?;
+        self.write_message(
+            "Error",
+            Color::Red,
+            &format!("Could not complete this prompt: {}", redact_text(message)),
+        )
+    }
+
+    fn clear_working(&mut self) -> io::Result<()> {
+        if self.waiting {
+            execute!(
+                self.stdout,
+                MoveUp(1),
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine)
+            )?;
+            self.waiting = false;
         }
+        Ok(())
     }
-}
 
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
+    fn write_message(&mut self, label: &str, color: Color, message: &str) -> io::Result<()> {
+        let mut lines = message.lines();
+        if let Some(first_line) = lines.next() {
+            self.write_label(label, color)?;
+            self.write_plain(": ")?;
+            self.write_plain(first_line)?;
+            self.write_plain("\n")?;
+        } else {
+            self.write_label(label, color)?;
+            self.write_plain(":\n")?;
+        }
+        for line in lines {
+            self.write_plain("  ")?;
+            self.write_plain(line)?;
+            self.write_plain("\n")?;
+        }
+        self.stdout.flush()
     }
-}
 
-pub fn is_exit_key(key: KeyEvent) -> bool {
-    key.code == KeyCode::Esc
-        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-}
+    fn write_label(&mut self, label: &str, color: Color) -> io::Result<()> {
+        execute!(
+            self.stdout,
+            SetForegroundColor(color),
+            SetAttribute(Attribute::Bold)
+        )?;
+        write!(self.stdout, "{label}")?;
+        execute!(self.stdout, SetAttribute(Attribute::Reset))?;
+        Ok(())
+    }
 
-fn render(frame: &mut ratatui::Frame<'_>, state: &ChatState) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-    let transcript = Text::from(
-        state
-            .transcript
-            .iter()
-            .flat_map(|entry| [Line::from(entry.clone()), Line::from("")])
-            .collect::<Vec<_>>(),
-    );
-    frame.render_widget(
-        Paragraph::new(transcript)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Adapt conversation "),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((state.scroll, 0)),
-        areas[0],
-    );
-    frame.render_widget(
-        Paragraph::new(state.input.as_str()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Prompt (Enter to send) "),
-        ),
-        areas[1],
-    );
-    let status_style = if state.status == ConnectionStatus::Error {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::Green)
-    };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Status: {}  ·  Esc/Ctrl-C to exit",
-            state.status.label()
-        ))
-        .style(status_style),
-        areas[2],
-    );
+    fn write_colored(&mut self, text: &str, color: Color) -> io::Result<()> {
+        execute!(self.stdout, SetForegroundColor(color))?;
+        write!(self.stdout, "{text}")?;
+        execute!(self.stdout, ResetColor)?;
+        self.stdout.flush()
+    }
+
+    fn write_plain(&mut self, text: &str) -> io::Result<()> {
+        write!(self.stdout, "{text}")?;
+        self.stdout.flush()
+    }
 }
 
 fn redact_value(value: Value) -> Value {
@@ -258,7 +156,7 @@ fn redact_value(value: Value) -> Value {
     }
 }
 
-fn redact_text(text: &str) -> String {
+pub fn redact_text(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut redact_next = false;
     let mut word_start = None;
@@ -291,82 +189,21 @@ fn redact_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use super::{redact_text, redact_value};
 
     #[test]
-    fn client_events_produce_a_visible_conversation() {
-        let mut state = ChatState::new();
-        state.set_ready();
-        state.apply(ClientEvent::PromptSubmitted("find incidents".into()));
-        state.apply(ClientEvent::ResponseStarted);
-        state.apply(ClientEvent::ResponseChunk("No active ".into()));
-        state.apply(ClientEvent::ResponseChunk("incidents.".into()));
-        state.apply(ClientEvent::ResponseCompleted);
-
-        assert_eq!(state.status, ConnectionStatus::Complete);
+    fn text_errors_redact_bearer_credentials() {
         assert_eq!(
-            state.transcript(),
-            ["You: find incidents", "Adapt: No active incidents."]
+            redact_text("request failed for Bearer secret"),
+            "request failed for Bearer [redacted]"
         );
     }
 
     #[test]
-    fn structured_results_and_errors_are_rendered_safely() {
-        let mut state = ChatState::new();
-        state.apply(ClientEvent::StructuredResult(serde_json::json!({
-            "citation": "runbook",
-            "bearer_token": "secret"
-        })));
-        state.apply(ClientEvent::Error(
-            "request failed for Bearer secret".into(),
-        ));
-
-        let transcript = state.transcript().join("\n");
-        assert!(transcript.contains("runbook"));
-        assert!(transcript.contains("[redacted]"));
-        assert!(!transcript.contains("secret"));
-        assert_eq!(state.status, ConnectionStatus::Error);
-    }
-
-    #[test]
-    fn input_and_exit_keys_are_handled_without_widget_state() {
-        let mut state = ChatState::new();
-        state.push_input('h');
-        state.push_input('i');
-        assert_eq!(state.take_prompt().as_deref(), Some("hi"));
-        state.pop_input();
-        assert_eq!(state.input(), "h");
-        assert!(is_exit_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(is_exit_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
-    }
-
-    #[test]
-    fn render_shows_the_prompt_transcript_and_safe_error() {
-        let mut state = ChatState::new();
-        state.push_input('h');
-        state.push_input('i');
-        state.apply(ClientEvent::PromptSubmitted("hi".into()));
-        state.apply(ClientEvent::Error("denied for Bearer secret".into()));
-        let backend = TestBackend::new(60, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &state)).unwrap();
-
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(rendered.contains("Adapt conversation"));
-        assert!(rendered.contains("Prompt (Enter to send)"));
-        assert!(rendered.contains("You: hi"));
-        assert!(rendered.contains("Error: denied for Bearer [redacted]"));
-        assert!(!rendered.contains("secret"));
+    fn structured_results_redact_sensitive_values() {
+        let value =
+            redact_value(serde_json::json!({"citation": "runbook", "bearer_token": "secret"}));
+        assert_eq!(value["citation"], "runbook");
+        assert_eq!(value["bearer_token"], "[redacted]");
     }
 }

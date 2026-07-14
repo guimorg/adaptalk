@@ -1,6 +1,6 @@
 # adapt-tui
 
-A small Rust chat terminal for using Adapt through its hosted MCP server.
+A small Rust terminal REPL for using Adapt through its hosted MCP server.
 
 > AdaptTUI is read-only by default: it exposes only MCP capabilities explicitly marked `readOnlyHint: true`. Mutating and ambiguously classified capabilities are rejected.
 
@@ -50,7 +50,21 @@ To get a bearer token, sign in to Adapt and follow the token setup instructions 
 
 AdaptTUI requires an `https://` endpoint because the bearer token is sent as authentication data. The `endpoint` setting is optional and is intended for an HTTPS Adapt endpoint such as a staging environment.
 
-The connectivity milestone initializes against Adapt's hosted endpoint and discovers only verified read-only capabilities. The client query seam accepts a prompt, invokes a selected verified capability, and preserves structured MCP results for the terminal layer.
+## Using the Terminal REPL
+
+After configuring a token, start the interactive REPL with:
+
+```sh
+cargo run
+```
+
+AdaptTUI first connects to the Adapt MCP Server and discovers capabilities, then prints a compact terminal prompt. Type at the `You ›` prompt and press Enter to submit it. Your prompt is cyan, Adapt replies are magenta, and the normal terminal scrollback preserves the conversation.
+
+- Use your terminal's normal scrolling controls to browse the conversation.
+- Press Ctrl-C to exit.
+- AdaptTUI invokes only capabilities verified as read-only. If none are available, the terminal displays that error rather than invoking an ambiguous capability.
+
+The connectivity milestone initializes against Adapt's hosted endpoint and discovers its capabilities. The client query seam accepts a prompt, invokes only a selected verified read-only capability, and preserves structured MCP results for the terminal layer.
 
 For development investigations only, `ask_adapt` can be enabled with an explicit process-only opt-in:
 
@@ -58,7 +72,7 @@ For development investigations only, `ask_adapt` can be enabled with an explicit
 cargo run -- --allow-unverified-ask-adapt "your prompt"
 ```
 
-This prints a warning because `ask_adapt` is not verified as read-only and may perform mutations. The flag is not stored in configuration, and no other unverified capability can be enabled by it.
+The interactive REPL prints a development-mode warning because `ask_adapt` is not verified as read-only and may perform mutations. The flag is not stored in configuration, and no other unverified capability can be enabled by it.
 
 ## Documentation
 
