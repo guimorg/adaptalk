@@ -50,7 +50,7 @@ Adapt currently exposes `ask_adapt`, which is not a verified read-only capabilit
 - [ ] Client errors are visible and distinguishable from successful responses.
 - [ ] Fake-transport tests cover read-only filtering, invocation, structured results, and rejection behavior.
 
-## ATUI-3 — Streaming Chat Terminal
+## ATUI-3 — Interactive Terminal REPL
 
 **Type:** AFK  
 **Blocked by:** ATUI-2  
@@ -58,18 +58,18 @@ Adapt currently exposes `ask_adapt`, which is not a verified read-only capabilit
 
 ### What to build
 
-Build the simple Ratatui/Crossterm Chat Terminal around client events. Render a scrollable transcript, stream response content when available, show a loading/completion fallback for non-streaming responses, and display structured results and citations inline.
+Build the simple Crossterm Terminal REPL around the client boundary. Use normal terminal input and native scrollback, show a loading/completion fallback, and display structured results and citations inline. Progressive response streaming is deferred until Adapt's progress semantics are verified.
 
 ### Acceptance criteria
 
-- [ ] The terminal presents a prompt input and conversation transcript.
-- [ ] Response chunks appear incrementally when the client emits streaming events.
-- [ ] A non-streaming response has a clear loading and completion state.
+- [ ] The terminal presents a line-oriented prompt and native scrollback conversation output.
+- [ ] Complete responses and structured results render with speaker-identifying output.
+- [ ] A response has a clear loading and completion state.
 - [ ] Structured results and citations are visible inline with the relevant response.
-- [ ] The transcript can be scrolled through long responses and prior prompts.
+- [ ] Native terminal scrolling remains available for long responses and prior prompts.
 - [ ] Connection, authentication, and MCP errors render without exposing secrets.
-- [ ] Normal terminal exit restores terminal state.
-- [ ] TUI tests assert user-visible behavior through client events rather than widget internals.
+- [ ] Normal terminal exit leaves the terminal in its normal mode.
+- [ ] REPL tests assert user-visible behavior rather than terminal-control internals.
 
 ## ATUI-4 — Local Adapt Session history
 

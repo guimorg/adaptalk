@@ -1,6 +1,11 @@
-use adapt_tui::{adapt_client::AdaptClient, config};
+use adapt_tui::{
+    adapt_client::{AdaptClient, QueryResponse},
+    chat_terminal::Repl,
+    config,
+};
 use anyhow::Result;
 use clap::Parser;
+use rmcp::model::RawContent;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 
@@ -23,34 +28,95 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
-    if args.allow_unverified_ask_adapt {
-        println!("{ASK_ADAPT_WARNING}");
-    }
-    let config = config::load()?;
-    println!("configuration: {}", config.source.display());
-    let client = AdaptClient::connect(&config).await?;
-    println!("connection: connected and initialized");
-    let capabilities = client.discover_read_only_capabilities().await?;
-    println!("capabilities: {}", capabilities.len());
-    for capability in capabilities {
-        println!("- {}", capability.name);
-    }
     if !args.prompt.is_empty() {
-        let prompt = args.prompt.join(" ");
-        let response = if args.allow_unverified_ask_adapt {
-            client.query_ask_adapt(&prompt, true).await?
-        } else {
-            client.query_read_only(&prompt).await?
-        };
-        println!("response: {}", serde_json::to_string_pretty(&response)?);
+        let config = config::load()?;
+        let client = AdaptClient::connect(&config).await?;
+        client.discover_capabilities().await?;
+        return run_prompt(&client, &args).await;
     }
+    run_terminal(args.allow_unverified_ask_adapt).await
+}
+
+async fn run_prompt(client: &AdaptClient, args: &Cli) -> Result<()> {
+    if args.allow_unverified_ask_adapt {
+        eprintln!("{ASK_ADAPT_WARNING}");
+    }
+    let prompt = args.prompt.join(" ");
+    let response = if args.allow_unverified_ask_adapt {
+        client.query_ask_adapt(&prompt, true).await?
+    } else {
+        client.query_read_only(&prompt).await?
+    };
+    println!("response: {}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
+    let mut repl = Repl::start(allow_unverified_ask_adapt)?;
+    let client: Result<AdaptClient> = async {
+        let config = config::load()?;
+        let client = AdaptClient::connect(&config).await?;
+        client.discover_capabilities().await?;
+        Ok(client)
+    }
+    .await;
+    let client = match client {
+        Ok(client) => client,
+        Err(error) => {
+            repl.show_error(&error.to_string())?;
+            return Ok(());
+        }
+    };
+
+    let mut remote_chat_id = None;
+    loop {
+        let Some(prompt) = repl.read_prompt()? else {
+            return Ok(());
+        };
+        if prompt.is_empty() {
+            continue;
+        }
+        repl.show_working()?;
+        let result = if allow_unverified_ask_adapt {
+            client
+                .query_ask_adapt_in_conversation(&prompt, remote_chat_id.as_deref(), true)
+                .await
+        } else {
+            client.query_read_only(&prompt).await
+        };
+        match result {
+            Ok(response) => {
+                if let Some(chat_id) = response.chat_id.clone() {
+                    remote_chat_id = Some(chat_id);
+                }
+                append_response(&mut repl, response)?;
+            }
+            Err(error) => repl.show_error(&error.to_string())?,
+        }
+    }
+}
+
+fn append_response(repl: &mut Repl, response: QueryResponse) -> std::io::Result<()> {
+    for content in response.content {
+        let content = match &content.raw {
+            RawContent::Text(text) => text.text.clone(),
+            _ => serde_json::to_string(&content)
+                .unwrap_or_else(|_| "[unrenderable response content]".to_owned()),
+        };
+        repl.show_adapt(&content)?;
+    }
+    if let Some(structured_content) = response.structured_content {
+        repl.show_structured_result(structured_content)?;
+    }
+    repl.finish_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::Cli;
+    use adapt_tui::{adapt_client::QueryResponse, chat_terminal::redact_text};
     use clap::{CommandFactory, Parser, error::ErrorKind};
+    use rmcp::model::{Content, RawContent};
 
     #[test]
     fn empty_arguments_do_not_submit_a_prompt() {
@@ -128,6 +194,24 @@ mod tests {
     fn warning_is_explicit_about_mutations() {
         assert!(super::ASK_ADAPT_WARNING.contains("not verified as read-only"));
         assert!(super::ASK_ADAPT_WARNING.contains("may perform mutations"));
+    }
+
+    #[test]
+    fn text_mcp_content_can_be_extracted_for_the_repl() {
+        let response = QueryResponse {
+            content: vec![Content::new(
+                RawContent::text("Hi Guilherme! What can I help with today?"),
+                None,
+            )],
+            structured_content: None,
+            chat_id: None,
+        };
+        let content = match &response.content[0].raw {
+            RawContent::Text(text) => text.text.clone(),
+            _ => unreachable!("test response contains text"),
+        };
+        assert_eq!(content, "Hi Guilherme! What can I help with today?");
+        assert_eq!(redact_text("Bearer secret"), "Bearer [redacted]");
     }
 
     #[test]
