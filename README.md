@@ -1,12 +1,14 @@
 # adapt-tui
 
-A small, read-only Rust chat terminal for using Adapt through its hosted MCP server.
+A small Rust chat terminal for using Adapt through its hosted MCP server.
+
+> Warning: AdaptTUI currently does not provide safety measures, confirmation prompts, or approval workflows for Adapt mutations or actions. Do not treat this application as a safety boundary around Adapt.
 
 The project is intentionally starting as a thin Adapt client:
 
 - chat-first terminal interaction;
 - streamed responses when the MCP transport supports them;
-- read-only capabilities only;
+- capability discovery through Adapt's MCP server;
 - local session history under `.adapt/sessions/`;
 - bearer-token configuration under `.adapt/`, separate from history.
 
@@ -48,7 +50,7 @@ To get a bearer token, sign in to Adapt and follow the token setup instructions 
 
 AdaptTUI requires an `https://` endpoint because the bearer token is sent as authentication data. The `endpoint` setting is optional and is intended for an HTTPS Adapt endpoint such as a staging environment.
 
-The first implementation milestone is MCP connectivity: initialize against Adapt's hosted endpoint, discover tools, permit only verified read-only tools, and print one structured response.
+The first implementation milestone is MCP connectivity: initialize against Adapt's hosted endpoint, discover the server's capabilities, and print their names.
 
 ## Documentation
 

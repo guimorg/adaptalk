@@ -8,7 +8,7 @@ async fn main() -> Result<()> {
     let client = AdaptClient::connect(&config).await?;
     println!("connection: connected and initialized");
     let capabilities = client.discover_capabilities().await?;
-    println!("safe capabilities: {}", capabilities.len());
+    println!("capabilities: {}", capabilities.len());
     for capability in capabilities {
         println!("- {}", capability.name);
     }

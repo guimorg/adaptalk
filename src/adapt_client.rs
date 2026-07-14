@@ -9,25 +9,10 @@ use thiserror::Error;
 
 use crate::config::AdaptConfig;
 
-/// Contract-verified read-only tools. New names require explicit review before exposure.
-pub const READ_ONLY_ALLOWLIST: &[&str] = &["search", "fetch"];
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Capability {
     pub name: String,
     pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdvertisedCapability {
-    pub name: String,
-    pub description: Option<String>,
-    pub annotations: Option<CapabilityAnnotations>,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilityAnnotations {
-    pub read_only_hint: Option<bool>,
-    pub destructive_hint: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -36,36 +21,6 @@ pub enum AdaptClientError {
     AuthenticationRejected,
     #[error("Adapt endpoint or transport failed: {0}")]
     Transport(String),
-    #[error("Adapt returned an invalid capability list: {0}")]
-    CapabilityRejected(String),
-}
-
-pub fn filter_capabilities(
-    tools: impl IntoIterator<Item = AdvertisedCapability>,
-) -> Result<Vec<Capability>, AdaptClientError> {
-    let mut safe = Vec::new();
-    for tool in tools {
-        if !READ_ONLY_ALLOWLIST.contains(&tool.name.as_str()) {
-            continue;
-        }
-        let Some(a) = tool.annotations else {
-            return Err(AdaptClientError::CapabilityRejected(format!(
-                "'{name}' has no safety metadata",
-                name = tool.name
-            )));
-        };
-        if a.read_only_hint != Some(true) || a.destructive_hint == Some(true) {
-            return Err(AdaptClientError::CapabilityRejected(format!(
-                "'{name}' has ambiguous safety metadata",
-                name = tool.name
-            )));
-        }
-        safe.push(Capability {
-            name: tool.name,
-            description: tool.description,
-        });
-    }
-    Ok(safe)
 }
 
 pub struct AdaptClient {
@@ -96,14 +51,13 @@ impl AdaptClient {
             .list_all_tools()
             .await
             .map_err(|e| map_transport_error(e, &self.credential))?;
-        filter_capabilities(tools.into_iter().map(|tool| AdvertisedCapability {
-            name: tool.name.to_string(),
-            description: tool.description.map(|d| d.to_string()),
-            annotations: tool.annotations.map(|a| CapabilityAnnotations {
-                read_only_hint: a.read_only_hint,
-                destructive_hint: a.destructive_hint,
-            }),
-        }))
+        Ok(tools
+            .into_iter()
+            .map(|tool| Capability {
+                name: tool.name.to_string(),
+                description: tool.description.map(|d| d.to_string()),
+            })
+            .collect())
     }
 }
 
@@ -137,38 +91,6 @@ fn sanitize_transport_error(text: &str, credential: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn c(name: &str, ro: Option<bool>, destructive: Option<bool>) -> AdvertisedCapability {
-        AdvertisedCapability {
-            name: name.into(),
-            description: None,
-            annotations: Some(CapabilityAnnotations {
-                read_only_hint: ro,
-                destructive_hint: destructive,
-            }),
-        }
-    }
-    #[test]
-    fn allowlist_and_metadata_fail_closed() {
-        assert_eq!(
-            filter_capabilities([
-                c("search", Some(true), Some(false)),
-                c("mutate", Some(true), Some(false))
-            ])
-            .unwrap()
-            .len(),
-            1
-        );
-        assert!(filter_capabilities([c("search", None, Some(false))]).is_err());
-        assert!(filter_capabilities([c("search", Some(true), Some(true))]).is_err());
-    }
-    #[test]
-    fn unknown_is_hidden() {
-        assert!(
-            filter_capabilities([c("unknown", None, None)])
-                .unwrap()
-                .is_empty()
-        );
-    }
 
     #[test]
     fn transport_errors_redact_the_credential() {
