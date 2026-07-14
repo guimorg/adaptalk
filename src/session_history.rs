@@ -56,6 +56,8 @@ pub struct Session {
     pub updated_at_ms: u128,
     pub status: SessionStatus,
     pub remote_chat_id: Option<String>,
+    #[serde(default)]
+    pub resumed_from_session_id: Option<String>,
     pub entries: Vec<SessionEntry>,
 }
 
@@ -73,6 +75,7 @@ pub enum HistoryError {
     Malformed { path: PathBuf },
 }
 
+#[derive(Clone)]
 pub struct SessionHistory {
     directory: PathBuf,
     token: String,
@@ -106,6 +109,14 @@ impl SessionHistory {
     }
 
     pub fn create(&self) -> Result<Session, HistoryError> {
+        self.create_continuation(None, None)
+    }
+
+    pub fn create_continuation(
+        &self,
+        resumed_from_session_id: Option<&str>,
+        remote_chat_id: Option<&str>,
+    ) -> Result<Session, HistoryError> {
         let now = timestamp_ms();
         let mut session = Session {
             id: format!(
@@ -117,7 +128,8 @@ impl SessionHistory {
             started_at_ms: now,
             updated_at_ms: now,
             status: SessionStatus::Active,
-            remote_chat_id: None,
+            remote_chat_id: remote_chat_id.map(|id| self.redact_text(id)),
+            resumed_from_session_id: resumed_from_session_id.map(str::to_owned),
             entries: Vec::new(),
         };
         self.save(&mut session)?;
@@ -357,6 +369,21 @@ mod tests {
             history.load(&session.id).unwrap().status,
             SessionStatus::Completed
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn continuation_sessions_retain_their_origin_and_remote_chat_id() {
+        let (history, directory) = history("continuation");
+        let session = history
+            .create_continuation(Some("previous-session"), Some("chat-123"))
+            .unwrap();
+        let loaded = history.load(&session.id).unwrap();
+        assert_eq!(
+            loaded.resumed_from_session_id.as_deref(),
+            Some("previous-session")
+        );
+        assert_eq!(loaded.remote_chat_id.as_deref(), Some("chat-123"));
         let _ = fs::remove_dir_all(directory);
     }
     #[test]

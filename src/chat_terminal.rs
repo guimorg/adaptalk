@@ -12,6 +12,7 @@ use serde_json::Value;
 pub struct Repl {
     stdout: io::Stdout,
     waiting: bool,
+    unverified_development_mode: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,7 +26,6 @@ const COMMAND_PALETTE: [(&str, &str); 2] = [
     ("/history", "Browse saved local sessions"),
     ("/open <id>", "Reopen a saved transcript"),
 ];
-const COMMAND_PALETTE_ROWS: u16 = COMMAND_PALETTE.len() as u16 + 1;
 
 pub fn parse_command(input: &str) -> Option<ReplCommand> {
     let input = input.trim();
@@ -47,7 +47,25 @@ pub fn parse_command(input: &str) -> Option<ReplCommand> {
 }
 
 fn shows_command_palette(input: &str) -> bool {
-    input == "/"
+    !matching_commands(input).is_empty()
+}
+
+fn matching_commands(input: &str) -> Vec<(&'static str, &'static str)> {
+    let Some(query) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    COMMAND_PALETTE
+        .into_iter()
+        .filter(|(command, _)| fuzzy_matches(command.trim_start_matches('/'), query))
+        .collect()
+}
+
+fn fuzzy_matches(command: &str, query: &str) -> bool {
+    let mut command = command.chars().flat_map(char::to_lowercase);
+    query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|character| command.any(|candidate| candidate == character))
 }
 
 struct RawModeGuard;
@@ -70,23 +88,30 @@ impl Repl {
         let mut repl = Self {
             stdout: io::stdout(),
             waiting: false,
+            unverified_development_mode,
         };
-        execute!(repl.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-        repl.write_plain("AdaptTUI · Read-only mode · Ctrl-C to exit\n")?;
-        if unverified_development_mode {
-            repl.write_colored(
+        repl.clear_transcript()?;
+        Ok(repl)
+    }
+
+    pub fn clear_transcript(&mut self) -> io::Result<()> {
+        execute!(self.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        self.write_plain("AdaptTUI · Read-only mode · Ctrl-C to exit\n")?;
+        if self.unverified_development_mode {
+            self.write_colored(
                 "⚠ DEVELOPMENT MODE: ask_adapt is unverified and may perform mutations.\n",
                 Color::Yellow,
             )?;
         }
-        Ok(repl)
+        self.waiting = false;
+        Ok(())
     }
 
     pub fn read_prompt(&mut self) -> io::Result<Option<String>> {
-        self.render_input("", false)?;
+        self.render_input("", 0)?;
         let _raw_mode = RawModeGuard::enable()?;
         let mut input = String::new();
-        let mut palette_visible = false;
+        let mut palette_rows = 0;
         loop {
             let Event::Key(key) = event::read()? else {
                 continue;
@@ -96,7 +121,7 @@ impl Repl {
             }
             match key.code {
                 KeyCode::Enter => {
-                    self.clear_command_palette(palette_visible)?;
+                    self.clear_command_palette(palette_rows)?;
                     self.write_plain("\r\n")?;
                     return Ok(Some(input.trim().to_owned()));
                 }
@@ -110,7 +135,7 @@ impl Repl {
                 KeyCode::Char('d')
                     if key.modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() =>
                 {
-                    self.clear_command_palette(palette_visible)?;
+                    self.clear_command_palette(palette_rows)?;
                     self.write_plain("\r\n")?;
                     return Ok(None);
                 }
@@ -119,8 +144,8 @@ impl Repl {
                 }
                 _ => continue,
             }
-            self.render_input(&input, palette_visible)?;
-            palette_visible = shows_command_palette(&input);
+            self.render_input(&input, palette_rows)?;
+            palette_rows = command_palette_rows(&input);
         }
     }
 
@@ -177,12 +202,13 @@ impl Repl {
         Ok(())
     }
 
-    fn render_input(&mut self, input: &str, previous_palette: bool) -> io::Result<()> {
+    fn render_input(&mut self, input: &str, previous_palette_rows: u16) -> io::Result<()> {
         execute!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         self.write_label("You", Color::Cyan)?;
         self.write_plain(" › ")?;
         self.write_plain(input)?;
-        self.clear_command_palette(previous_palette)?;
+        self.clear_command_palette(previous_palette_rows)?;
+        let commands = matching_commands(input);
         if shows_command_palette(input) {
             execute!(
                 self.stdout,
@@ -192,7 +218,7 @@ impl Repl {
                 Clear(ClearType::CurrentLine)
             )?;
             self.write_colored("  Commands", Color::DarkGrey)?;
-            for (command, description) in COMMAND_PALETTE {
+            for (command, description) in commands {
                 execute!(
                     self.stdout,
                     MoveDown(1),
@@ -207,9 +233,9 @@ impl Repl {
         self.stdout.flush()
     }
 
-    fn clear_command_palette(&mut self, visible: bool) -> io::Result<()> {
-        if visible {
-            for _ in 0..COMMAND_PALETTE_ROWS {
+    fn clear_command_palette(&mut self, rows: u16) -> io::Result<()> {
+        if rows > 0 {
+            for _ in 0..rows {
                 execute!(
                     self.stdout,
                     MoveDown(1),
@@ -217,7 +243,7 @@ impl Repl {
                     Clear(ClearType::CurrentLine)
                 )?;
             }
-            execute!(self.stdout, MoveUp(COMMAND_PALETTE_ROWS))?;
+            execute!(self.stdout, MoveUp(rows))?;
         }
         Ok(())
     }
@@ -262,6 +288,18 @@ impl Repl {
     fn write_plain(&mut self, text: &str) -> io::Result<()> {
         write!(self.stdout, "{text}")?;
         self.stdout.flush()
+    }
+}
+
+fn command_palette_rows(input: &str) -> u16 {
+    let count: u16 = matching_commands(input)
+        .len()
+        .try_into()
+        .unwrap_or(u16::MAX);
+    if count == 0 {
+        0
+    } else {
+        count.saturating_add(1)
     }
 }
 
@@ -324,7 +362,10 @@ pub fn redact_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplCommand, parse_command, redact_text, redact_value, shows_command_palette};
+    use super::{
+        ReplCommand, matching_commands, parse_command, redact_text, redact_value,
+        shows_command_palette,
+    };
 
     #[test]
     fn text_errors_redact_bearer_credentials() {
@@ -358,7 +399,29 @@ mod tests {
     #[test]
     fn slash_opens_the_command_palette() {
         assert!(shows_command_palette("/"));
-        assert!(!shows_command_palette("/history"));
+        assert!(shows_command_palette("/his"));
+        assert!(shows_command_palette("/ope"));
+        assert!(shows_command_palette("/history"));
+        assert!(!shows_command_palette("/unknown"));
+        assert!(!shows_command_palette(""));
         assert!(!shows_command_palette("ask Adapt"));
+    }
+
+    #[test]
+    fn palette_fuzzy_filters_to_matching_commands() {
+        assert_eq!(
+            matching_commands("/his")
+                .into_iter()
+                .map(|(command, _)| command)
+                .collect::<Vec<_>>(),
+            vec!["/history"]
+        );
+        assert_eq!(
+            matching_commands("/pn")
+                .into_iter()
+                .map(|(command, _)| command)
+                .collect::<Vec<_>>(),
+            vec!["/open <id>"]
+        );
     }
 }

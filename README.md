@@ -69,7 +69,7 @@ After a successful connection, AdaptTUI saves a redacted JSON snapshot after eve
 Two REPL commands work entirely locally, before any configuration is read or MCP connection is made:
 
 - `/history` lists saved sessions with their ID, status, and first-prompt summary.
-- `/open <id>` renders one saved transcript. It does not contact Adapt or continue the remote conversation.
+- `/open <id>` saves the active transcript, clears the terminal, and renders the selected transcript. The next prompt starts a new local snapshot linked to it. With `--allow-unverified-ask-adapt`, that prompt also sends the saved Adapt chat ID to continue the remote conversation; normal read-only mode never does.
 
 Type `/` at the prompt to see these commands in a compact suggestion palette.
 

@@ -9,6 +9,12 @@ use clap::Parser;
 use rmcp::model::RawContent;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
+const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
+
+struct ResumeTarget {
+    session_id: String,
+    remote_chat_id: Option<String>,
+}
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -59,6 +65,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut history: Option<SessionHistory> = None;
     let mut session: Option<Session> = None;
     let mut remote_chat_id = None;
+    let mut resume_target: Option<ResumeTarget> = None;
     loop {
         let Some(prompt) = repl.read_prompt()? else {
             if let (Some(history), Some(session)) = (&history, &mut session) {
@@ -72,7 +79,33 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         if let Some(command) = parse_command(&prompt) {
             match command {
                 ReplCommand::History => show_history(&mut repl, &offline_history)?,
-                ReplCommand::Open(id) => open_history(&mut repl, &offline_history, &id)?,
+                ReplCommand::Open(id) => {
+                    if let Some(opened) = load_history(&mut repl, &offline_history, &id)? {
+                        if let (Some(history), Some(session)) = (&history, &mut session) {
+                            history.complete(session)?;
+                        }
+                        remote_chat_id = if allow_unverified_ask_adapt {
+                            opened.remote_chat_id.clone()
+                        } else {
+                            None
+                        };
+                        resume_target = Some(ResumeTarget {
+                            session_id: opened.id.clone(),
+                            remote_chat_id: opened.remote_chat_id.clone(),
+                        });
+                        session = None;
+                        repl.clear_transcript()?;
+                        render_history(&mut repl, opened)?;
+                        if resume_target
+                            .as_ref()
+                            .is_some_and(|target| target.remote_chat_id.is_none())
+                        {
+                            repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
+                        } else if !allow_unverified_ask_adapt {
+                            repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
+                        }
+                    }
+                }
                 ReplCommand::Unknown(message) => repl.show_error(&message)?,
             }
             continue;
@@ -100,9 +133,19 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
             };
             let session_history =
                 SessionHistory::for_credential_file(&config.source, &config.bearer_token);
-            session = Some(session_history.create()?);
             history = Some(session_history);
             client = Some(connected);
+        }
+        if session.is_none() {
+            let history = history.as_ref().expect("initialized with the client");
+            session = Some(if let Some(target) = resume_target.take() {
+                history.create_continuation(
+                    Some(&target.session_id),
+                    target.remote_chat_id.as_deref(),
+                )?
+            } else {
+                history.create()?
+            });
         }
         let client = client.as_ref().expect("initialized above");
         if let (Some(history), Some(session)) = (&history, &mut session) {
@@ -174,14 +217,18 @@ fn show_history(repl: &mut Repl, history: &SessionHistory) -> Result<()> {
     Ok(())
 }
 
-fn open_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<()> {
+fn load_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<Option<Session>> {
     let session = match history.load(id) {
         Ok(session) => session,
         Err(error) => {
             repl.show_error(&error.to_string())?;
-            return Ok(());
+            return Ok(None);
         }
     };
+    Ok(Some(session))
+}
+
+fn render_history(repl: &mut Repl, session: Session) -> Result<()> {
     repl.show_notice(&format!(
         "Session {} · {}",
         session.id,
