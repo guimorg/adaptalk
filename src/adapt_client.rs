@@ -1,10 +1,12 @@
 use rmcp::{
     ClientHandler, ServiceExt,
+    model::{CallToolRequestParams, CallToolResult},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde::Serialize;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::config::AdaptConfig;
@@ -15,10 +17,25 @@ pub struct Capability {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueryResponse {
+    pub content: Vec<rmcp::model::Content>,
+    pub structured_content: Option<Value>,
+}
+
+// Keep this list empty until Adapt documents and verifies a non-mutating
+// capability. MCP annotations are hints supplied by the remote server, not a
+// sufficient authorization boundary on their own.
+const VERIFIED_READ_ONLY_CAPABILITIES: &[&str] = &[];
+
 #[derive(Debug, Error)]
 pub enum AdaptClientError {
     #[error("Adapt authentication was rejected by the server")]
     AuthenticationRejected,
+    #[error("Adapt capability `{0}` is not verified as read-only")]
+    CapabilityNotReadOnly(String),
+    #[error("Adapt capability `{0}` returned an error")]
+    CapabilityFailed(String),
     #[error("Adapt endpoint or transport failed: {0}")]
     Transport(String),
 }
@@ -59,6 +76,83 @@ impl AdaptClient {
             })
             .collect())
     }
+
+    /// Return only capabilities explicitly verified as read-only by Adapt.
+    ///
+    /// A server annotation is required, but it is not sufficient: the name
+    /// must also be present in the Adapt-specific verification list below.
+    pub async fn discover_read_only_capabilities(
+        &self,
+    ) -> Result<Vec<Capability>, AdaptClientError> {
+        let tools = self
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| map_transport_error(e, &self.credential))?;
+        Ok(tools
+            .into_iter()
+            .filter(is_verified_read_only)
+            .map(|tool| Capability {
+                name: tool.name.to_string(),
+                description: tool.description.map(|d| d.to_string()),
+            })
+            .collect())
+    }
+
+    /// Invoke a selected read-only capability with the user's prompt.
+    pub async fn query(
+        &self,
+        capability: &str,
+        prompt: &str,
+    ) -> Result<QueryResponse, AdaptClientError> {
+        let tools = self
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| map_transport_error(e, &self.credential))?;
+        let Some(tool) = tools.into_iter().find(|tool| tool.name == capability) else {
+            return Err(AdaptClientError::CapabilityNotReadOnly(
+                capability.to_owned(),
+            ));
+        };
+        if !is_verified_read_only(&tool) {
+            return Err(AdaptClientError::CapabilityNotReadOnly(
+                capability.to_owned(),
+            ));
+        }
+
+        let mut arguments = Map::new();
+        arguments.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
+        let result: CallToolResult = self
+            .service
+            .peer()
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: capability.to_owned().into(),
+                arguments: Some(arguments),
+                task: None,
+            })
+            .await
+            .map_err(|e| map_transport_error(e, &self.credential))?;
+        if result.is_error == Some(true) {
+            return Err(AdaptClientError::CapabilityFailed(capability.to_owned()));
+        }
+        Ok(QueryResponse {
+            content: result.content,
+            structured_content: result.structured_content,
+        })
+    }
+}
+
+fn is_verified_read_only(tool: &rmcp::model::Tool) -> bool {
+    VERIFIED_READ_ONLY_CAPABILITIES.contains(&tool.name.as_ref())
+        && tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            == Some(true)
 }
 
 fn transport_config(config: &AdaptConfig) -> StreamableHttpClientTransportConfig {
@@ -132,5 +226,29 @@ mod tests {
             transport_config(&config).auth_header.as_deref(),
             Some("session-token")
         );
+    }
+
+    #[test]
+    fn read_only_policy_requires_an_explicit_true_annotation() {
+        let mut tool = rmcp::model::Tool::new("safe", "safe query", Map::new());
+        assert!(!is_verified_read_only(&tool));
+        tool.annotations = Some(rmcp::model::ToolAnnotations {
+            read_only_hint: Some(false),
+            ..Default::default()
+        });
+        assert!(!is_verified_read_only(&tool));
+        tool.annotations.as_mut().unwrap().read_only_hint = Some(true);
+        assert!(!is_verified_read_only(&tool));
+    }
+
+    #[test]
+    fn ask_adapt_is_rejected_even_if_the_server_claims_it_is_read_only() {
+        let tool = rmcp::model::Tool::new("ask_adapt", "Adapt query", Map::new()).annotate(
+            rmcp::model::ToolAnnotations {
+                read_only_hint: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(!is_verified_read_only(&tool));
     }
 }

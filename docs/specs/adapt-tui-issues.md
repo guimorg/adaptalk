@@ -34,6 +34,10 @@ Connect AdaptTUI to Adapt's hosted MCP Server using the configured bearer token.
 
 Submit one Chat Prompt through the Adapt Client, select a verified non-mutating MCP capability, invoke it, and render the completed structured response. Capabilities that are mutating or cannot be confidently classified must be rejected or hidden.
 
+### Revised implementation plan
+
+Adapt currently exposes `ask_adapt`, which is not a verified read-only capability. ATUI-2 therefore remains fail-closed and does not invoke it. The client keeps the query seam and requires both an explicit `readOnlyHint: true` annotation and an Adapt-specific verified capability allowlist entry. The allowlist remains empty until Adapt documents and verifies a genuinely non-mutating capability.
+
 ### Acceptance criteria
 
 - [ ] A user can enter and submit a natural-language Chat Prompt.
