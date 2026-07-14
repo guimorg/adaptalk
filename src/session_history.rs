@@ -245,6 +245,19 @@ impl SessionHistory {
             other => other,
         })
     }
+    /// Resolve continuation from this session's responses, then its immutable lineage.
+    pub fn latest_remote_chat_id(&self, session: &Session) -> Result<Option<String>, HistoryError> {
+        let mut current = session.clone();
+        loop {
+            if let Some(chat_id) = current.latest_remote_chat_id() {
+                return Ok(Some(chat_id.to_owned()));
+            }
+            let Some(origin) = current.resumed_from_session_id else {
+                return Ok(None);
+            };
+            current = self.load(&origin.to_string())?;
+        }
+    }
     fn append(&self, session: &mut Session, kind: SessionEntryKind) -> Result<(), HistoryError> {
         session.entries.push(SessionEntry {
             timestamp_ms: timestamp_ms(),
@@ -356,6 +369,27 @@ mod tests {
         let session = history.create_continuation(Some(origin.clone())).unwrap();
         let loaded = history.load(&session.id.to_string()).unwrap();
         assert_eq!(loaded.resumed_from_session_id, Some(origin));
+        let _ = fs::remove_dir_all(directory);
+    }
+    #[test]
+    fn continuation_uses_the_latest_response_from_its_origin() {
+        let (history, directory) = history("continuation-chat-id");
+        let mut origin = history.create().unwrap();
+        history
+            .append_response(
+                &mut origin,
+                RedactedTranscriptResponse::new(TranscriptResponse {
+                    text_blocks: vec![],
+                    structured_result: None,
+                    remote_chat_id: Some("chat-1".into()),
+                }),
+            )
+            .unwrap();
+        let continuation = history.create_continuation(Some(origin.id)).unwrap();
+        assert_eq!(
+            history.latest_remote_chat_id(&continuation).unwrap(),
+            Some("chat-1".into())
+        );
         let _ = fs::remove_dir_all(directory);
     }
     #[test]
