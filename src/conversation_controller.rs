@@ -1,6 +1,6 @@
 //! State transitions for local Adapt conversations, independent of connection setup.
 
-use std::{future::Future, pin::Pin};
+use std::pin::Pin;
 
 use anyhow::Result;
 
@@ -22,8 +22,12 @@ pub struct Connection<Q> {
     pub redactor: Redactor,
 }
 
-pub enum RenderIntent {
-    ShowHistory(Session),
+pub enum SubmitOutcome {
+    Response(TranscriptResponse),
+    ResponseWithPersistenceWarning {
+        response: TranscriptResponse,
+        error: crate::session_history::HistoryError,
+    },
 }
 
 enum ConversationState<Q> {
@@ -72,15 +76,6 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         }
     }
 
-    /// Resolve external connection work before applying the local transition.
-    /// A failed future leaves the current state untouched.
-    pub async fn connect_with<F>(&mut self, connection: F) -> Result<()>
-    where
-        F: Future<Output = Result<Connection<Q>>>,
-    {
-        self.connect(connection.await?)
-    }
-
     /// Start a fresh local session, or a continuation of the viewed session.
     /// Session creation succeeds before state changes, so an error leaves the view intact.
     pub fn connect(&mut self, connection: Connection<Q>) -> Result<()> {
@@ -90,7 +85,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         let resumed_from = match &self.state {
             ConversationState::ViewingHistory(session) => Some(session.id.clone()),
             ConversationState::Disconnected => None,
-            ConversationState::Connected(_) => unreachable!(),
+            ConversationState::Connected(_) => return Ok(()),
         };
         let session = if let Some(origin) = resumed_from {
             connection.history.create_continuation(Some(origin))?
@@ -106,10 +101,10 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         Ok(())
     }
 
-    pub fn open(&mut self, session: Session) -> Result<RenderIntent> {
+    pub fn open(&mut self, session: Session) -> Result<Session> {
         self.finish()?;
         self.state = ConversationState::ViewingHistory(session.clone());
-        Ok(RenderIntent::ShowHistory(session))
+        Ok(session)
     }
 
     pub fn finish(&mut self) -> Result<()> {
@@ -119,21 +114,27 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         Ok(())
     }
 
-    pub async fn submit(&mut self, prompt: &str) -> Result<TranscriptResponse> {
+    pub async fn submit(&mut self, prompt: &str) -> Result<SubmitOutcome> {
         let ConversationState::Connected(active) = &mut self.state else {
             anyhow::bail!("a connection is required before submitting a prompt");
         };
         active
             .history
             .append_prompt(&mut active.session, self.redactor.transcript_text(prompt))?;
-        let continuation = active.session.latest_remote_chat_id();
-        match active.query.query(prompt, continuation).await {
+        let continuation = active.history.latest_remote_chat_id(&active.session)?;
+        match active.query.query(prompt, continuation.as_deref()).await {
             Ok(response) => {
                 let display = response.as_inner().clone();
-                active
+                match active
                     .history
-                    .append_response(&mut active.session, response)?;
-                Ok(display)
+                    .append_response(&mut active.session, response)
+                {
+                    Ok(()) => Ok(SubmitOutcome::Response(display)),
+                    Err(error) => Ok(SubmitOutcome::ResponseWithPersistenceWarning {
+                        response: display,
+                        error,
+                    }),
+                }
             }
             Err(error) => {
                 active.history.append_error(
@@ -188,12 +189,17 @@ mod tests {
     #[tokio::test]
     async fn opening_history_then_connecting_creates_a_local_continuation() {
         let (history, directory) = history("open");
-        let origin = history.create().unwrap();
+        let mut origin = history.create().unwrap();
+        let origin_response = response(&Redactor::default(), Some("chat-1"));
+        history
+            .append_response(&mut origin, origin_response)
+            .unwrap();
         let mut controller = ConversationController::new(history.clone());
         controller.open(origin.clone()).unwrap();
         let redactor = Redactor::default();
+        let calls = Rc::new(RefCell::new(vec![]));
         let query = Query {
-            calls: Rc::new(RefCell::new(vec![])),
+            calls: calls.clone(),
             results: Rc::new(RefCell::new(vec![Ok(response(&redactor, None))])),
         };
         controller
@@ -210,6 +216,7 @@ mod tests {
                 .iter()
                 .any(|session| session.resumed_from_session_id.as_ref() == Some(&origin.id))
         );
+        assert_eq!(*calls.borrow(), vec![Some("chat-1".into())]);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -243,23 +250,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
-    #[tokio::test]
-    async fn failed_connection_restores_the_history_view() {
+    #[test]
+    fn opening_history_retains_the_history_view() {
         let (history, directory) = history("failed-connect");
         let opened = history.create().unwrap();
         let mut controller: ConversationController<Query> = ConversationController::new(history);
-        controller.open(opened.clone()).unwrap();
-        assert!(
-            controller
-                .connect_with(async { Err(anyhow::anyhow!("offline")) })
-                .await
-                .is_err()
-        );
+        assert_eq!(controller.open(opened.clone()).unwrap().id, opened.id);
         assert_eq!(
             controller.viewing_session().map(|session| &session.id),
             Some(&opened.id)
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[derive(Clone)]
+    struct SaveFailingQuery {
+        directory: std::path::PathBuf,
+        response: RedactedTranscriptResponse,
+    }
+
+    impl ConversationQuery for SaveFailingQuery {
+        fn query<'a>(
+            &'a self,
+            _prompt: &'a str,
+            _continuation: Option<&'a str>,
+        ) -> QueryFuture<'a> {
+            let directory = self.directory.clone();
+            let response = self.response.clone();
+            Box::pin(async move {
+                std::fs::remove_dir_all(&directory).unwrap();
+                std::fs::write(&directory, "not a directory").unwrap();
+                Ok(response)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_success_with_a_history_write_failure_is_not_an_error() {
+        let (history, directory) = history("response-save-failure");
+        let redactor = Redactor::default();
+        let query = SaveFailingQuery {
+            directory: directory.clone(),
+            response: response(&redactor, Some("chat-1")),
+        };
+        let mut controller = ConversationController::new(history.clone());
+        controller
+            .connect(Connection {
+                query,
+                history,
+                redactor,
+            })
+            .unwrap();
+        assert!(matches!(
+            controller.submit("prompt").await.unwrap(),
+            SubmitOutcome::ResponseWithPersistenceWarning { .. }
+        ));
+        std::fs::remove_file(directory).unwrap();
     }
 
     #[tokio::test]

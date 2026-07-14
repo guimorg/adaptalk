@@ -3,7 +3,7 @@ use adapt_tui::{
     chat_terminal::{Repl, ReplCommand, parse_command},
     config,
     conversation_controller::{
-        Connection, ConversationController, ConversationQuery, QueryFuture, RenderIntent,
+        Connection, ConversationController, ConversationQuery, QueryFuture, SubmitOutcome,
     },
     redaction::Redactor,
     session_history::{Session, SessionEntryKind, SessionHistory, TranscriptResponse},
@@ -117,7 +117,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 ReplCommand::History => show_history(&mut repl, controller.history())?,
                 ReplCommand::Open(id) => {
                     if let Some(session) = load_history(&mut repl, controller.history(), &id)? {
-                        let RenderIntent::ShowHistory(opened) = controller.open(session)?;
+                        let opened = controller.open(session)?;
                         repl.clear_transcript()?;
                         render_history(&mut repl, &opened)?;
                         if opened.latest_remote_chat_id().is_none() {
@@ -133,8 +133,14 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         }
         repl.show_working()?;
         if controller.needs_connection() {
-            let connection = connect_terminal(allow_unverified_ask_adapt);
-            if let Err(error) = controller.connect_with(connection).await {
+            let connection = match connect_terminal(allow_unverified_ask_adapt).await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    repl.show_error(&controller.redactor().text(&error.to_string()))?;
+                    continue;
+                }
+            };
+            if let Err(error) = controller.connect(connection) {
                 repl.show_error(&controller.redactor().text(&error.to_string()))?;
                 continue;
             }
@@ -142,7 +148,13 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         let result = controller.submit(&prompt).await;
         repl.set_redactor(controller.redactor());
         match result {
-            Ok(response) => render_response(&mut repl, response)?,
+            Ok(SubmitOutcome::Response(response)) => render_response(&mut repl, response)?,
+            Ok(SubmitOutcome::ResponseWithPersistenceWarning { response, error }) => {
+                render_response(&mut repl, response)?;
+                repl.show_notice(&format!(
+                    "warning: response was received but could not be saved locally: {error}"
+                ))?;
+            }
             Err(error) => repl.show_error(&controller.redactor().text(&error.to_string()))?,
         }
     }
