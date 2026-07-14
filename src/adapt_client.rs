@@ -36,6 +36,8 @@ pub enum AdaptClientError {
     CapabilityNotReadOnly(String),
     #[error("Adapt capability `{0}` returned an error")]
     CapabilityFailed(String),
+    #[error("Adapt has no verified read-only capability available")]
+    NoReadOnlyCapability,
     #[error("Adapt endpoint or transport failed: {0}")]
     Transport(String),
 }
@@ -143,6 +145,18 @@ impl AdaptClient {
             content: result.content,
             structured_content: result.structured_content,
         })
+    }
+
+    /// Submit a prompt through the only available verified read-only capability.
+    ///
+    /// Keeping capability selection here prevents the terminal layer from making
+    /// policy decisions or accidentally invoking an unverified tool.
+    pub async fn query_read_only(&self, prompt: &str) -> Result<QueryResponse, AdaptClientError> {
+        let capabilities = self.discover_read_only_capabilities().await?;
+        let capability = capabilities
+            .first()
+            .ok_or(AdaptClientError::NoReadOnlyCapability)?;
+        self.query(&capability.name, prompt).await
     }
 }
 
