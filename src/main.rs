@@ -1,58 +1,28 @@
 use adapt_tui::{adapt_client::AdaptClient, config};
 use anyhow::Result;
+use clap::Parser;
 
-const ALLOW_UNVERIFIED_ASK_ADAPT: &str = "--allow-unverified-ask-adapt";
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
-const HELP: &str = "Usage: adapt-tui [OPTIONS] [PROMPT...]
 
-Options:
-    -h, --help                    Show this help message
-    --allow-unverified-ask-adapt  Enable the unverified ask_adapt capability for development";
-
-#[derive(Debug, PartialEq, Eq)]
-struct CliArgs {
-    prompt: Option<String>,
+#[derive(Debug, Parser, PartialEq, Eq)]
+#[command(
+    name = "adapt-tui",
+    version,
+    about = "A read-only terminal client for Adapt's MCP server"
+)]
+struct Cli {
+    /// Enable the unverified ask_adapt capability for development investigations.
+    #[arg(long)]
     allow_unverified_ask_adapt: bool,
-    help: bool,
-}
 
-fn parse_args<I>(args: I) -> CliArgs
-where
-    I: IntoIterator,
-    I::Item: AsRef<str>,
-{
-    let mut allow_unverified_ask_adapt = false;
-    let mut help = false;
-    let prompt = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_owned())
-        .filter(|arg| {
-            if arg == ALLOW_UNVERIFIED_ASK_ADAPT {
-                allow_unverified_ask_adapt = true;
-                false
-            } else if arg == "--help" || arg == "-h" {
-                help = true;
-                false
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    CliArgs {
-        prompt: (!prompt.is_empty()).then_some(prompt),
-        allow_unverified_ask_adapt,
-        help,
-    }
+    /// Natural-language prompt to submit.
+    #[arg(value_name = "PROMPT")]
+    prompt: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = parse_args(std::env::args().skip(1));
-    if args.help {
-        println!("{HELP}");
-        return Ok(());
-    }
+    let args = Cli::parse();
     if args.allow_unverified_ask_adapt {
         println!("{ASK_ADAPT_WARNING}");
     }
@@ -65,7 +35,8 @@ async fn main() -> Result<()> {
     for capability in capabilities {
         println!("- {}", capability.name);
     }
-    if let Some(prompt) = args.prompt {
+    if !args.prompt.is_empty() {
+        let prompt = args.prompt.join(" ");
         let response = if args.allow_unverified_ask_adapt {
             client.query_ask_adapt(&prompt, true).await?
         } else {
@@ -78,29 +49,43 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliArgs, parse_args};
+    use super::Cli;
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     #[test]
     fn empty_arguments_do_not_submit_a_prompt() {
-        assert_eq!(parse_args(Vec::<String>::new()).prompt, None);
+        assert!(
+            Cli::try_parse_from(["adapt-tui"])
+                .unwrap()
+                .prompt
+                .is_empty()
+        );
     }
 
     #[test]
     fn prompt_arguments_are_joined_for_submission() {
         assert_eq!(
-            parse_args(["find", "recent", "incidents"]).prompt,
-            Some("find recent incidents".to_owned())
+            Cli::try_parse_from(["adapt-tui", "find", "recent", "incidents"])
+                .unwrap()
+                .prompt
+                .join(" "),
+            "find recent incidents"
         );
     }
 
     #[test]
     fn opt_in_flag_is_removed_from_prompt() {
         assert_eq!(
-            parse_args(["--allow-unverified-ask-adapt", "find", "incidents"]),
-            CliArgs {
-                prompt: Some("find incidents".to_owned()),
+            Cli::try_parse_from([
+                "adapt-tui",
+                "--allow-unverified-ask-adapt",
+                "find",
+                "incidents",
+            ])
+            .unwrap(),
+            Cli {
+                prompt: vec!["find".to_owned(), "incidents".to_owned()],
                 allow_unverified_ask_adapt: true,
-                help: false,
             }
         );
     }
@@ -108,33 +93,45 @@ mod tests {
     #[test]
     fn flag_alone_does_not_create_a_prompt() {
         assert_eq!(
-            parse_args(["--allow-unverified-ask-adapt"]),
-            CliArgs {
-                prompt: None,
+            Cli::try_parse_from(["adapt-tui", "--allow-unverified-ask-adapt"]).unwrap(),
+            Cli {
+                prompt: vec![],
                 allow_unverified_ask_adapt: true,
-                help: false,
             }
         );
     }
 
     #[test]
-    fn help_flags_are_not_submitted_as_prompts() {
-        assert_eq!(
-            parse_args(["--help"]),
-            CliArgs {
-                prompt: None,
-                allow_unverified_ask_adapt: false,
-                help: true,
-            }
-        );
-        assert!(parse_args(["-h"]).help);
-        assert!(super::HELP.contains("Usage: adapt-tui"));
-        assert!(super::HELP.contains("--allow-unverified-ask-adapt"));
+    fn help_flags_are_handled_by_clap() {
+        for flag in ["--help", "-h"] {
+            let error = Cli::try_parse_from(["adapt-tui", flag]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert!(error.to_string().contains("Usage: adapt-tui"));
+            assert!(error.to_string().contains("--allow-unverified-ask-adapt"));
+        }
+    }
+
+    #[test]
+    fn version_flag_is_handled_by_clap() {
+        let error = Cli::try_parse_from(["adapt-tui", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().starts_with("adapt-tui "));
+    }
+
+    #[test]
+    fn unknown_options_are_rejected() {
+        let error = Cli::try_parse_from(["adapt-tui", "--unknown"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]
     fn warning_is_explicit_about_mutations() {
         assert!(super::ASK_ADAPT_WARNING.contains("not verified as read-only"));
         assert!(super::ASK_ADAPT_WARNING.contains("may perform mutations"));
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 }
