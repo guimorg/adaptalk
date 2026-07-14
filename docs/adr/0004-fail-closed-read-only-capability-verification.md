@@ -14,6 +14,8 @@ AdaptTUI requires both an explicit `readOnlyHint: true` annotation and an Adapt-
 
 As a temporary development exception, the process-only `--allow-unverified-ask-adapt` flag permits the narrowly scoped `ask_adapt` query method. The CLI must print a warning that the capability is not verified as read-only and may perform mutations. The flag does not authorize arbitrary unverified capabilities and is never persisted.
 
+Capability policy is discovered lazily and cached as the raw MCP tool list for the lifetime of one `AdaptClient` session. Discovery and query validation therefore share one authoritative snapshot, while every invocation still validates the cached tool's name and annotation at the client boundary. A failed initial discovery is not cached, so later access may retry. There is no automatic refresh in this slice; a long-lived client can therefore observe stale capability metadata until a future explicit refresh operation or a new client is created.
+
 ## Consequences
 
-The default remains fail-closed, while development users have an explicit, visible escape hatch for `ask_adapt`. When Adapt provides a suitable verified capability, adding its name and contract tests will enable the normal query seam without weakening the boundary; the temporary exception can then be removed.
+The default remains fail-closed, while development users have an explicit, visible escape hatch for `ask_adapt`. The snapshot removes repeated discovery round trips and keeps policy decisions inside the adapter, trading freshness during a client session for predictable validation. When Adapt provides a suitable verified capability, adding its name and contract tests will enable the normal query seam without weakening the boundary; the temporary exception can then be removed.
