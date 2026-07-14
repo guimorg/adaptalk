@@ -1,10 +1,11 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 use crossterm::{
-    cursor::{MoveTo, MoveToColumn, MoveUp},
+    cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{Clear, ClearType},
+    terminal::{self, Clear, ClearType},
 };
 use serde_json::Value;
 
@@ -19,6 +20,12 @@ pub enum ReplCommand {
     Open(String),
     Unknown(String),
 }
+
+const COMMAND_PALETTE: [(&str, &str); 2] = [
+    ("/history", "Browse saved local sessions"),
+    ("/open <id>", "Reopen a saved transcript"),
+];
+const COMMAND_PALETTE_ROWS: u16 = COMMAND_PALETTE.len() as u16 + 1;
 
 pub fn parse_command(input: &str) -> Option<ReplCommand> {
     let input = input.trim();
@@ -36,6 +43,25 @@ pub fn parse_command(input: &str) -> Option<ReplCommand> {
         _ => Some(ReplCommand::Unknown(format!(
             "unknown command `{input}`; use /history or /open <id>"
         ))),
+    }
+}
+
+fn shows_command_palette(input: &str) -> bool {
+    input == "/"
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -57,20 +83,50 @@ impl Repl {
     }
 
     pub fn read_prompt(&mut self) -> io::Result<Option<String>> {
-        self.write_label("You", Color::Cyan)?;
-        self.write_plain(" › ")?;
+        self.render_input("", false)?;
+        let _raw_mode = RawModeGuard::enable()?;
         let mut input = String::new();
-        let read = io::stdin().lock().read_line(&mut input)?;
-        if read == 0 {
-            self.write_plain("\n")?;
-            return Ok(None);
+        let mut palette_visible = false;
+        loop {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    self.clear_command_palette(palette_visible)?;
+                    self.write_plain("\r\n")?;
+                    return Ok(Some(input.trim().to_owned()));
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Esc => input.clear(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+                }
+                KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() =>
+                {
+                    self.clear_command_palette(palette_visible)?;
+                    self.write_plain("\r\n")?;
+                    return Ok(None);
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.push(character);
+                }
+                _ => continue,
+            }
+            self.render_input(&input, palette_visible)?;
+            palette_visible = shows_command_palette(&input);
         }
-        Ok(Some(input.trim().to_owned()))
     }
 
     pub fn show_working(&mut self) -> io::Result<()> {
         self.write_label("Adapt", Color::Yellow)?;
-        self.write_plain(": is working…\n")?;
+        self.write_plain(": is working…\r\n")?;
         self.waiting = true;
         Ok(())
     }
@@ -121,21 +177,66 @@ impl Repl {
         Ok(())
     }
 
+    fn render_input(&mut self, input: &str, previous_palette: bool) -> io::Result<()> {
+        execute!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        self.write_label("You", Color::Cyan)?;
+        self.write_plain(" › ")?;
+        self.write_plain(input)?;
+        self.clear_command_palette(previous_palette)?;
+        if shows_command_palette(input) {
+            execute!(
+                self.stdout,
+                SavePosition,
+                MoveDown(1),
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine)
+            )?;
+            self.write_colored("  Commands", Color::DarkGrey)?;
+            for (command, description) in COMMAND_PALETTE {
+                execute!(
+                    self.stdout,
+                    MoveDown(1),
+                    MoveToColumn(0),
+                    Clear(ClearType::CurrentLine)
+                )?;
+                self.write_colored(&format!("  {command:<12}"), Color::Cyan)?;
+                self.write_colored(description, Color::DarkGrey)?;
+            }
+            execute!(self.stdout, RestorePosition)?;
+        }
+        self.stdout.flush()
+    }
+
+    fn clear_command_palette(&mut self, visible: bool) -> io::Result<()> {
+        if visible {
+            for _ in 0..COMMAND_PALETTE_ROWS {
+                execute!(
+                    self.stdout,
+                    MoveDown(1),
+                    MoveToColumn(0),
+                    Clear(ClearType::CurrentLine)
+                )?;
+            }
+            execute!(self.stdout, MoveUp(COMMAND_PALETTE_ROWS))?;
+        }
+        Ok(())
+    }
+
     fn write_message(&mut self, label: &str, color: Color, message: &str) -> io::Result<()> {
         let mut lines = message.lines();
         if let Some(first_line) = lines.next() {
             self.write_label(label, color)?;
             self.write_plain(": ")?;
             self.write_plain(first_line)?;
-            self.write_plain("\n")?;
+            self.write_plain("\r\n")?;
         } else {
             self.write_label(label, color)?;
-            self.write_plain(":\n")?;
+            self.write_plain(":\r\n")?;
         }
         for line in lines {
             self.write_plain("  ")?;
             self.write_plain(line)?;
-            self.write_plain("\n")?;
+            self.write_plain("\r\n")?;
         }
         self.stdout.flush()
     }
@@ -223,7 +324,7 @@ pub fn redact_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplCommand, parse_command, redact_text, redact_value};
+    use super::{ReplCommand, parse_command, redact_text, redact_value, shows_command_palette};
 
     #[test]
     fn text_errors_redact_bearer_credentials() {
@@ -252,5 +353,12 @@ mod tests {
             parse_command("/wat"),
             Some(ReplCommand::Unknown(_))
         ));
+    }
+
+    #[test]
+    fn slash_opens_the_command_palette() {
+        assert!(shows_command_palette("/"));
+        assert!(!shows_command_palette("/history"));
+        assert!(!shows_command_palette("ask Adapt"));
     }
 }

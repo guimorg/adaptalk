@@ -71,6 +71,8 @@ Two REPL commands work entirely locally, before any configuration is read or MCP
 - `/history` lists saved sessions with their ID, status, and first-prompt summary.
 - `/open <id>` renders one saved transcript. It does not contact Adapt or continue the remote conversation.
 
+Type `/` at the prompt to see these commands in a compact suggestion palette.
+
 The connectivity milestone initializes against Adapt's hosted endpoint and discovers its capabilities. The client query seam accepts a prompt, invokes only a selected verified read-only capability, and preserves structured MCP results for the terminal layer.
 
 For development investigations only, `ask_adapt` can be enabled with an explicit process-only opt-in:
