@@ -13,10 +13,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::transcript::TranscriptResponse;
+
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
 
 impl SessionId {
@@ -50,8 +51,7 @@ impl fmt::Display for SessionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     Active,
     Completed,
@@ -66,7 +66,7 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionEntry {
     timestamp_ms: u128,
     kind: SessionEntryKind,
@@ -76,19 +76,6 @@ impl SessionEntry {
     pub fn kind(&self) -> &SessionEntryKind {
         &self.kind
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TextBlock {
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TranscriptResponse {
-    pub text_blocks: Vec<TextBlock>,
-    /// A deliberately opaque, already-redacted result for inline display.
-    pub structured_result: Option<serde_json::Value>,
-    pub remote_chat_id: Option<String>,
 }
 
 /// Data that has passed through the application redaction boundary.
@@ -119,23 +106,182 @@ impl RedactedTranscriptResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionEntryKind {
     Prompt { text: String },
     Response(TranscriptResponse),
     Error { message: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     id: SessionId,
     started_at_ms: u128,
     updated_at_ms: u128,
     status: SessionStatus,
-    #[serde(default)]
     resumed_from_session_id: Option<SessionId>,
     entries: Vec<SessionEntry>,
+}
+
+/// Private on-disk representation. Public session models are deliberately not serde types:
+/// only this module can deserialize a snapshot or serialize a redacted session.
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    id: String,
+    started_at_ms: u128,
+    updated_at_ms: u128,
+    status: StoredSessionStatus,
+    #[serde(default)]
+    resumed_from_session_id: Option<String>,
+    entries: Vec<StoredSessionEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredSessionStatus {
+    Active,
+    Completed,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredSessionEntry {
+    timestamp_ms: u128,
+    kind: StoredSessionEntryKind,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StoredSessionEntryKind {
+    Prompt { text: String },
+    Response(StoredTranscriptResponse),
+    Error { message: String },
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTranscriptResponse {
+    text_blocks: Vec<StoredTextBlock>,
+    structured_result: Option<serde_json::Value>,
+    remote_chat_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredTextBlock {
+    text: String,
+}
+
+impl From<&Session> for StoredSession {
+    fn from(session: &Session) -> Self {
+        Self {
+            id: session.id.to_string(),
+            started_at_ms: session.started_at_ms,
+            updated_at_ms: session.updated_at_ms,
+            status: match session.status {
+                SessionStatus::Active => StoredSessionStatus::Active,
+                SessionStatus::Completed => StoredSessionStatus::Completed,
+            },
+            resumed_from_session_id: session
+                .resumed_from_session_id
+                .as_ref()
+                .map(ToString::to_string),
+            entries: session
+                .entries
+                .iter()
+                .map(StoredSessionEntry::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<StoredSession> for Session {
+    type Error = ();
+
+    fn try_from(session: StoredSession) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: SessionId::parse(&session.id).map_err(|_| ())?,
+            started_at_ms: session.started_at_ms,
+            updated_at_ms: session.updated_at_ms,
+            status: match session.status {
+                StoredSessionStatus::Active => SessionStatus::Active,
+                StoredSessionStatus::Completed => SessionStatus::Completed,
+            },
+            resumed_from_session_id: session
+                .resumed_from_session_id
+                .map(|id| SessionId::parse(&id))
+                .transpose()
+                .map_err(|_| ())?,
+            entries: session
+                .entries
+                .into_iter()
+                .map(SessionEntry::try_from)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<&SessionEntry> for StoredSessionEntry {
+    fn from(entry: &SessionEntry) -> Self {
+        Self {
+            timestamp_ms: entry.timestamp_ms,
+            kind: match &entry.kind {
+                SessionEntryKind::Prompt { text } => {
+                    StoredSessionEntryKind::Prompt { text: text.clone() }
+                }
+                SessionEntryKind::Response(response) => {
+                    StoredSessionEntryKind::Response(StoredTranscriptResponse::from(response))
+                }
+                SessionEntryKind::Error { message } => StoredSessionEntryKind::Error {
+                    message: message.clone(),
+                },
+            },
+        }
+    }
+}
+
+impl TryFrom<StoredSessionEntry> for SessionEntry {
+    type Error = ();
+
+    fn try_from(entry: StoredSessionEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            timestamp_ms: entry.timestamp_ms,
+            kind: match entry.kind {
+                StoredSessionEntryKind::Prompt { text } => SessionEntryKind::Prompt { text },
+                StoredSessionEntryKind::Response(response) => {
+                    SessionEntryKind::Response(TranscriptResponse::from(response))
+                }
+                StoredSessionEntryKind::Error { message } => SessionEntryKind::Error { message },
+            },
+        })
+    }
+}
+
+impl From<&TranscriptResponse> for StoredTranscriptResponse {
+    fn from(response: &TranscriptResponse) -> Self {
+        Self {
+            text_blocks: response
+                .text_blocks
+                .iter()
+                .map(|block| StoredTextBlock {
+                    text: block.text.clone(),
+                })
+                .collect(),
+            structured_result: response.structured_result.clone(),
+            remote_chat_id: response.remote_chat_id.clone(),
+        }
+    }
+}
+
+impl From<StoredTranscriptResponse> for TranscriptResponse {
+    fn from(response: StoredTranscriptResponse) -> Self {
+        Self {
+            text_blocks: response
+                .text_blocks
+                .into_iter()
+                .map(|block| crate::transcript::TextBlock { text: block.text })
+                .collect(),
+            structured_result: response.structured_result,
+            remote_chat_id: response.remote_chat_id,
+        }
+    }
 }
 
 impl Session {
@@ -319,7 +465,7 @@ impl SessionHistory {
         session.updated_at_ms = timestamp_ms();
         let path = self.path_for(&session.id);
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let serialized = serde_json::to_vec_pretty(session)
+        let serialized = serde_json::to_vec_pretty(&StoredSession::from(&*session))
             .map_err(|_| HistoryError::Write { path: path.clone() })?;
         fs::write(&temporary, serialized)
             .map_err(|_| HistoryError::Write { path: path.clone() })?;
@@ -334,7 +480,11 @@ fn load_file(path: &Path) -> Result<Session, HistoryError> {
     let text = fs::read_to_string(path).map_err(|_| HistoryError::Read {
         path: path.to_path_buf(),
     })?;
-    serde_json::from_str(&text).map_err(|_| HistoryError::Malformed {
+    let stored: StoredSession =
+        serde_json::from_str(&text).map_err(|_| HistoryError::Malformed {
+            path: path.to_path_buf(),
+        })?;
+    Session::try_from(stored).map_err(|_| HistoryError::Malformed {
         path: path.to_path_buf(),
     })
 }
@@ -348,6 +498,7 @@ fn timestamp_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::{TextBlock, TranscriptResponse};
     fn history(name: &str) -> (SessionHistory, PathBuf) {
         let directory =
             std::env::temp_dir().join(format!("adapt-tui-history-{name}-{}", std::process::id()));

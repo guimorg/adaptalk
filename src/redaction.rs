@@ -2,7 +2,10 @@
 
 use serde_json::Value;
 
-use crate::session_history::{RedactedText, RedactedTranscriptResponse, TranscriptResponse};
+use crate::{
+    session_history::{RedactedText, RedactedTranscriptResponse},
+    transcript::{TextBlock, TranscriptResponse},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct Redactor {
@@ -69,7 +72,7 @@ impl Redactor {
             text_blocks: response
                 .text_blocks
                 .into_iter()
-                .map(|block| crate::session_history::TextBlock {
+                .map(|block| TextBlock {
                     text: self.text(&block.text),
                 })
                 .collect(),

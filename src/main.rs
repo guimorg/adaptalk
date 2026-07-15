@@ -6,8 +6,8 @@ use adapt_tui::{
         Connection, ConversationController, ConversationQuery, QueryFuture, SubmitOutcome,
     },
     redaction::Redactor,
-    session_history::{Session, SessionEntryKind, SessionHistory, TranscriptResponse},
-    transcript,
+    session_history::{Session, SessionEntryKind, SessionHistory},
+    transcript::{self, TranscriptResponse},
 };
 use anyhow::Result;
 use clap::Parser;
@@ -90,7 +90,8 @@ async fn run_prompt(args: &Cli) -> Result<()> {
         serde_json::to_string_pretty(
             &redactor
                 .transcript_response(transcript::from_query_response(response)?)
-                .into_inner(),
+                .into_inner()
+                .display_value(),
         )?
     );
     Ok(())
@@ -131,17 +132,16 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
             let connection = match connect_terminal(allow_unverified_ask_adapt).await {
                 Ok(connection) => connection,
                 Err(error) => {
-                    repl.show_error(&controller.redactor().text(&error.to_string()))?;
+                    repl.show_error(&controller.redact(&error.to_string()))?;
                     continue;
                 }
             };
             if let Err(error) = controller.connect(connection) {
-                repl.show_error(&controller.redactor().text(&error.to_string()))?;
+                repl.show_error(&controller.redact(&error.to_string()))?;
                 continue;
             }
         }
         let result = controller.submit(&prompt).await;
-        repl.set_redactor(controller.redactor());
         match result {
             Ok(SubmitOutcome::Response(response)) => render_response(&mut repl, response)?,
             Ok(SubmitOutcome::ResponseWithPersistenceWarning { response, error }) => {
@@ -150,7 +150,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                     "warning: response was received but could not be saved locally: {error}"
                 ))?;
             }
-            Err(error) => repl.show_error(&controller.redactor().text(&error.to_string()))?,
+            Err(error) => repl.show_error(&controller.redact(&error.to_string()))?,
         }
     }
 }
@@ -288,7 +288,7 @@ mod tests {
         let transcript = Redactor::new("top-secret")
             .transcript_response(transcript::from_query_response(response).unwrap())
             .into_inner();
-        let stored = serde_json::to_string(&transcript).unwrap();
+        let stored = transcript.display_value().to_string();
         assert!(!stored.contains("top-secret"));
     }
 }

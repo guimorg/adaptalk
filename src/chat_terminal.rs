@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 
-use crate::redaction::Redactor;
 use crossterm::{
     cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -14,7 +13,6 @@ pub struct Repl {
     stdout: io::Stdout,
     waiting: bool,
     unverified_development_mode: bool,
-    redactor: Redactor,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,14 +89,9 @@ impl Repl {
             stdout: io::stdout(),
             waiting: false,
             unverified_development_mode,
-            redactor: Redactor::default(),
         };
         repl.clear_transcript()?;
         Ok(repl)
-    }
-
-    pub fn set_redactor(&mut self, redactor: Redactor) {
-        self.redactor = redactor;
     }
 
     pub fn clear_transcript(&mut self) -> io::Result<()> {
@@ -175,21 +168,21 @@ impl Repl {
     }
 
     pub fn show_you(&mut self, message: &str) -> io::Result<()> {
-        self.write_message("You", Color::Cyan, &self.redactor.text(message))
+        self.write_message("You", Color::Cyan, message)
     }
 
     pub fn show_notice(&mut self, message: &str) -> io::Result<()> {
-        self.write_message("History", Color::Green, &self.redactor.text(message))
+        self.write_message("History", Color::Green, message)
     }
 
     pub fn show_adapt(&mut self, message: &str) -> io::Result<()> {
         self.clear_working()?;
-        self.write_message("Adapt", Color::Magenta, &self.redactor.text(message))
+        self.write_message("Adapt", Color::Magenta, message)
     }
 
     pub fn show_structured_result(&mut self, value: Value) -> io::Result<()> {
         self.clear_working()?;
-        let rendered = serde_json::to_string_pretty(&self.redactor.value(value))
+        let rendered = serde_json::to_string_pretty(&value)
             .unwrap_or_else(|_| "[unrenderable structured result]".to_owned());
         self.write_message("Result", Color::Blue, &rendered)
     }
@@ -203,10 +196,7 @@ impl Repl {
         self.write_message(
             "Error",
             Color::Red,
-            &format!(
-                "Could not complete this prompt: {}",
-                self.redactor.text(message)
-            ),
+            &format!("Could not complete this prompt: {}", message),
         )
     }
 

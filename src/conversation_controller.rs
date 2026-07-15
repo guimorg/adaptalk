@@ -6,7 +6,8 @@ use anyhow::Result;
 
 use crate::{
     redaction::Redactor,
-    session_history::{Session, SessionHistory, TranscriptResponse},
+    session_history::{Session, SessionHistory},
+    transcript::TranscriptResponse,
 };
 
 pub type QueryFuture<'a> = Pin<Box<dyn Future<Output = Result<TranscriptResponse>> + 'a>>;
@@ -59,8 +60,9 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         &self.history
     }
 
-    pub fn redactor(&self) -> Redactor {
-        self.redactor.clone()
+    /// Redact terminal-only values that arise outside a submitted transcript.
+    pub fn redact(&self, value: &str) -> String {
+        self.redactor.text(value)
     }
 
     pub fn needs_connection(&self) -> bool {
@@ -114,6 +116,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
     pub fn finish(&mut self) -> Result<()> {
         if let ConversationState::Connected(active) = &mut self.state {
             self.history.complete(&mut active.session)?;
+            self.state = ConversationState::Disconnected;
         }
         Ok(())
     }
@@ -153,7 +156,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::session_history::{TextBlock, TranscriptResponse};
+    use crate::transcript::{TextBlock, TranscriptResponse};
 
     #[derive(Clone)]
     struct Query {
@@ -346,11 +349,33 @@ mod tests {
         let SubmitOutcome::Response(display) = controller.submit("prompt").await.unwrap() else {
             panic!("response persistence should succeed");
         };
-        assert!(!serde_json::to_string(&display).unwrap().contains(secret));
+        assert!(!format!("{display:?}").contains(secret));
+        assert!(!format!("{:?}", history.list().unwrap()).contains(secret));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn finishing_disconnects_before_another_prompt_can_be_appended() {
+        let (history, directory) = history("finish-disconnects");
+        let mut controller = ConversationController::new(history.clone());
+        controller
+            .connect(Connection {
+                query: Query {
+                    calls: Rc::new(RefCell::new(vec![])),
+                    results: Rc::new(RefCell::new(vec![Ok(response(Some("chat-1")))])),
+                },
+                redactor: Redactor::default(),
+            })
+            .unwrap();
+        controller.submit("first").await.unwrap();
+        controller.finish().unwrap();
+
+        assert!(controller.needs_connection());
+        assert!(controller.submit("second").await.is_err());
         assert!(
-            !serde_json::to_string(&history.list().unwrap())
-                .unwrap()
-                .contains(secret)
+            history.list().unwrap().iter().all(
+                |session| session.status() == &crate::session_history::SessionStatus::Completed
+            )
         );
         let _ = std::fs::remove_dir_all(directory);
     }
