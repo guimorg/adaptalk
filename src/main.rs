@@ -15,6 +15,7 @@ use std::time::Duration;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
+const CONTINUATION_FALLBACK_NOTICE: &str = "Remote continuation failed; the previous session may have expired. The next prompt starts a fresh Adapt session.";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -148,10 +149,18 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                         let opened = controller.open(session)?;
                         repl.clear_transcript()?;
                         render_history(&mut repl, &opened).await?;
-                        if controller.viewing_continuation()?.is_none() {
-                            repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
-                        } else if !allow_unverified_ask_adapt {
-                            repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
+                        match controller.viewing_continuation()? {
+                            None => {
+                                repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
+                            }
+                            Some(_) if !allow_unverified_ask_adapt => {
+                                repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
+                            }
+                            Some(chat_id) => {
+                                repl.show_notice(&format!(
+                                    "Remote session {chat_id} available; the next prompt will attempt to resume the Adapt session."
+                                ))?;
+                            }
                         }
                     }
                 }
@@ -201,6 +210,20 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 persistence_error,
             }) => {
                 repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(&format!(
+                    "warning: the error could not be saved locally: {persistence_error}"
+                ))?;
+            }
+            Ok(SubmitOutcome::ContinuationFailed { error }) => {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(CONTINUATION_FALLBACK_NOTICE)?;
+            }
+            Ok(SubmitOutcome::ContinuationFailedWithPersistenceWarning {
+                error,
+                persistence_error,
+            }) => {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(CONTINUATION_FALLBACK_NOTICE)?;
                 repl.show_notice(&format!(
                     "warning: the error could not be saved locally: {persistence_error}"
                 ))?;
