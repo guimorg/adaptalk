@@ -271,10 +271,8 @@ mod tests {
     }
 
     fn history(name: &str) -> (SessionHistory, std::path::PathBuf) {
-        let directory = std::env::temp_dir().join(format!(
-            "adapt-tui-controller-{name}-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("adaptalk-controller-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         (SessionHistory::at(&directory), directory)
     }

@@ -1,5 +1,5 @@
 [package]
-name = "adapt-tui"
+name = "adaptalk"
 version = "0.1.0"
 edition = "2024"
 description = "A read-only terminal client for Adapt's MCP server"

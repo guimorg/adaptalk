@@ -1,4 +1,4 @@
-use adapt_tui::{
+use adaptalk::{
     adapt_client::AdaptClient,
     chat_terminal::{Repl, ReplCommand, parse_command},
     config,
@@ -19,7 +19,7 @@ const CONTINUATION_FALLBACK_NOTICE: &str = "Remote continuation failed; the prev
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
-    name = "adapt-tui",
+    name = "adaptalk",
     version,
     about = "A read-only terminal client for Adapt's MCP server"
 )]
@@ -313,22 +313,17 @@ mod tests {
     use std::time::Duration;
 
     use super::{Cli, ResponsePresentation};
-    use adapt_tui::{adapt_client::QueryResponse, redaction::Redactor, transcript};
+    use adaptalk::{adapt_client::QueryResponse, redaction::Redactor, transcript};
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use rmcp::model::{Content, RawContent};
     #[test]
     fn empty_arguments_do_not_submit_a_prompt() {
-        assert!(
-            Cli::try_parse_from(["adapt-tui"])
-                .unwrap()
-                .prompt
-                .is_empty()
-        );
+        assert!(Cli::try_parse_from(["adaptalk"]).unwrap().prompt.is_empty());
     }
     #[test]
     fn prompt_arguments_are_joined_for_submission() {
         assert_eq!(
-            Cli::try_parse_from(["adapt-tui", "find", "recent", "incidents"])
+            Cli::try_parse_from(["adaptalk", "find", "recent", "incidents"])
                 .unwrap()
                 .prompt
                 .join(" "),
@@ -338,7 +333,7 @@ mod tests {
     #[test]
     fn opt_in_flag_is_removed_from_prompt() {
         assert_eq!(
-            Cli::try_parse_from(["adapt-tui", "--allow-unverified-ask-adapt", "find"]).unwrap(),
+            Cli::try_parse_from(["adaptalk", "--allow-unverified-ask-adapt", "find"]).unwrap(),
             Cli {
                 prompt: vec!["find".into()],
                 allow_unverified_ask_adapt: true
@@ -348,19 +343,19 @@ mod tests {
     #[test]
     fn help_version_and_unknown_flags_are_handled_by_clap() {
         assert_eq!(
-            Cli::try_parse_from(["adapt-tui", "--help"])
+            Cli::try_parse_from(["adaptalk", "--help"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::DisplayHelp
         );
         assert_eq!(
-            Cli::try_parse_from(["adapt-tui", "--version"])
+            Cli::try_parse_from(["adaptalk", "--version"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::DisplayVersion
         );
         assert_eq!(
-            Cli::try_parse_from(["adapt-tui", "--unknown"])
+            Cli::try_parse_from(["adaptalk", "--unknown"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::UnknownArgument

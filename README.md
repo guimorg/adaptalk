@@ -1,4 +1,4 @@
-# adapt-tui
+# adaptalk
 
 A small Rust terminal REPL for using Adapt through its hosted MCP server.
 
@@ -19,16 +19,16 @@ The project is intentionally starting as a thin Adapt client:
 Download the latest release binary from the [Releases page](https://github.com/guimorg/adaptui/releases), then:
 
 ```sh
-chmod +x adapt-tui
-mv adapt-tui /usr/local/bin/
-adapt-tui
+chmod +x adaptalk
+mv adaptalk /usr/local/bin/
+adaptalk
 ```
 
 Or build from source:
 
 ```sh
 cargo install --git https://github.com/guimorg/adaptui
-adapt-tui
+adaptalk
 ```
 
 ## Development

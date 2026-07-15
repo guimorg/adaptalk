@@ -56,7 +56,7 @@ Each PR should do one thing. If you're refactoring across multiple areas, bundle
 
 Make sure `just check` passes before you push.
 
-If you're implementing a slice from `docs/specs/adapt-tui-issues.md` (ATUI-1, ATUI-2, etc.), reference it in the PR and check off the acceptance criteria.
+If you're implementing a slice from `docs/specs/adaptalk-issues.md` (ATUI-1, ATUI-2, etc.), reference it in the PR and check off the acceptance criteria.
 
 ## License
 

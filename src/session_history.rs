@@ -410,7 +410,7 @@ mod tests {
     use crate::transcript::{TextBlock, TranscriptResponse};
     fn history(name: &str) -> (SessionHistory, PathBuf) {
         let directory =
-            std::env::temp_dir().join(format!("adapt-tui-history-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("adaptalk-history-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         (SessionHistory::at(&directory), directory)
     }
