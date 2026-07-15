@@ -72,24 +72,17 @@ async fn main() -> Result<()> {
 }
 
 async fn run_prompt(args: &Cli) -> Result<()> {
-    let config = config::load()?;
-    let redactor = Redactor::new(&config.bearer_token);
-    let client = AdaptClient::connect(&config).await?;
-    client.discover_capabilities().await?;
+    let Connection { query, redactor } = connect_terminal(args.allow_unverified_ask_adapt).await?;
     if args.allow_unverified_ask_adapt {
         eprintln!("{}", redactor.text(ASK_ADAPT_WARNING));
     }
     let prompt = args.prompt.join(" ");
-    let response = if args.allow_unverified_ask_adapt {
-        client.query_ask_adapt(&prompt, true).await?
-    } else {
-        client.query_read_only(&prompt).await?
-    };
+    let response = query.query(&prompt, None).await?;
     println!(
         "response: {}",
         serde_json::to_string_pretty(
             &redactor
-                .transcript_response(transcript::from_query_response(response)?)
+                .transcript_response(response)
                 .into_inner()
                 .display_value(),
         )?

@@ -37,12 +37,12 @@ pub fn from_query_response(response: QueryResponse) -> Result<TranscriptResponse
         .content
         .into_iter()
         .map(|content| match content.raw {
-            RawContent::Text(text) => Ok(TextBlock { text: text.text }),
-            _ => Ok(TextBlock {
-                text: serde_json::to_string(&content)?,
-            }),
+            RawContent::Text(text) => TextBlock { text: text.text },
+            _ => TextBlock {
+                text: "[unsupported Adapt content]".into(),
+            },
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
     Ok(TranscriptResponse {
         text_blocks,
         structured_result: response.structured_content,
@@ -70,5 +70,23 @@ mod tests {
             Some(serde_json::json!({"citations": ["source"]}))
         );
         assert_eq!(transcript.remote_chat_id.as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn renders_non_text_content_as_a_stable_application_message() {
+        let transcript = from_query_response(QueryResponse {
+            content: vec![Content::new(
+                RawContent::image("raw-image-data", "image/png"),
+                None,
+            )],
+            structured_content: None,
+            chat_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            transcript.text_blocks[0].text,
+            "[unsupported Adapt content]"
+        );
     }
 }

@@ -379,4 +379,38 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(directory);
     }
+
+    #[tokio::test]
+    async fn failed_finish_keeps_the_active_session_submittable() {
+        let (history, directory) = history("failed-finish");
+        let mut controller = ConversationController::new(history.clone());
+        controller
+            .connect(Connection {
+                query: Query {
+                    calls: Rc::new(RefCell::new(vec![])),
+                    results: Rc::new(RefCell::new(vec![
+                        Ok(response(Some("chat-1"))),
+                        Ok(response(Some("chat-2"))),
+                    ])),
+                },
+                redactor: Redactor::default(),
+            })
+            .unwrap();
+        controller.submit("first").await.unwrap();
+
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, "not a directory").unwrap();
+        assert!(controller.finish().is_err());
+        std::fs::remove_file(&directory).unwrap();
+
+        controller.submit("second").await.unwrap();
+        assert!(
+            history
+                .list()
+                .unwrap()
+                .iter()
+                .all(|session| session.status() == &crate::session_history::SessionStatus::Active)
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

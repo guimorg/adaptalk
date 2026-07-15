@@ -10,10 +10,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::transcript::TranscriptResponse;
+
+mod stored;
+
+use stored::StoredSession;
 
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -121,167 +124,6 @@ pub struct Session {
     status: SessionStatus,
     resumed_from_session_id: Option<SessionId>,
     entries: Vec<SessionEntry>,
-}
-
-/// Private on-disk representation. Public session models are deliberately not serde types:
-/// only this module can deserialize a snapshot or serialize a redacted session.
-#[derive(Serialize, Deserialize)]
-struct StoredSession {
-    id: String,
-    started_at_ms: u128,
-    updated_at_ms: u128,
-    status: StoredSessionStatus,
-    #[serde(default)]
-    resumed_from_session_id: Option<String>,
-    entries: Vec<StoredSessionEntry>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StoredSessionStatus {
-    Active,
-    Completed,
-}
-
-#[derive(Serialize, Deserialize)]
-struct StoredSessionEntry {
-    timestamp_ms: u128,
-    kind: StoredSessionEntryKind,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum StoredSessionEntryKind {
-    Prompt { text: String },
-    Response(StoredTranscriptResponse),
-    Error { message: String },
-}
-
-#[derive(Serialize, Deserialize)]
-struct StoredTranscriptResponse {
-    text_blocks: Vec<StoredTextBlock>,
-    structured_result: Option<serde_json::Value>,
-    remote_chat_id: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct StoredTextBlock {
-    text: String,
-}
-
-impl From<&Session> for StoredSession {
-    fn from(session: &Session) -> Self {
-        Self {
-            id: session.id.to_string(),
-            started_at_ms: session.started_at_ms,
-            updated_at_ms: session.updated_at_ms,
-            status: match session.status {
-                SessionStatus::Active => StoredSessionStatus::Active,
-                SessionStatus::Completed => StoredSessionStatus::Completed,
-            },
-            resumed_from_session_id: session
-                .resumed_from_session_id
-                .as_ref()
-                .map(ToString::to_string),
-            entries: session
-                .entries
-                .iter()
-                .map(StoredSessionEntry::from)
-                .collect(),
-        }
-    }
-}
-
-impl TryFrom<StoredSession> for Session {
-    type Error = ();
-
-    fn try_from(session: StoredSession) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: SessionId::parse(&session.id).map_err(|_| ())?,
-            started_at_ms: session.started_at_ms,
-            updated_at_ms: session.updated_at_ms,
-            status: match session.status {
-                StoredSessionStatus::Active => SessionStatus::Active,
-                StoredSessionStatus::Completed => SessionStatus::Completed,
-            },
-            resumed_from_session_id: session
-                .resumed_from_session_id
-                .map(|id| SessionId::parse(&id))
-                .transpose()
-                .map_err(|_| ())?,
-            entries: session
-                .entries
-                .into_iter()
-                .map(SessionEntry::try_from)
-                .collect::<Result<_, _>>()?,
-        })
-    }
-}
-
-impl From<&SessionEntry> for StoredSessionEntry {
-    fn from(entry: &SessionEntry) -> Self {
-        Self {
-            timestamp_ms: entry.timestamp_ms,
-            kind: match &entry.kind {
-                SessionEntryKind::Prompt { text } => {
-                    StoredSessionEntryKind::Prompt { text: text.clone() }
-                }
-                SessionEntryKind::Response(response) => {
-                    StoredSessionEntryKind::Response(StoredTranscriptResponse::from(response))
-                }
-                SessionEntryKind::Error { message } => StoredSessionEntryKind::Error {
-                    message: message.clone(),
-                },
-            },
-        }
-    }
-}
-
-impl TryFrom<StoredSessionEntry> for SessionEntry {
-    type Error = ();
-
-    fn try_from(entry: StoredSessionEntry) -> Result<Self, Self::Error> {
-        Ok(Self {
-            timestamp_ms: entry.timestamp_ms,
-            kind: match entry.kind {
-                StoredSessionEntryKind::Prompt { text } => SessionEntryKind::Prompt { text },
-                StoredSessionEntryKind::Response(response) => {
-                    SessionEntryKind::Response(TranscriptResponse::from(response))
-                }
-                StoredSessionEntryKind::Error { message } => SessionEntryKind::Error { message },
-            },
-        })
-    }
-}
-
-impl From<&TranscriptResponse> for StoredTranscriptResponse {
-    fn from(response: &TranscriptResponse) -> Self {
-        Self {
-            text_blocks: response
-                .text_blocks
-                .iter()
-                .map(|block| StoredTextBlock {
-                    text: block.text.clone(),
-                })
-                .collect(),
-            structured_result: response.structured_result.clone(),
-            remote_chat_id: response.remote_chat_id.clone(),
-        }
-    }
-}
-
-impl From<StoredTranscriptResponse> for TranscriptResponse {
-    fn from(response: StoredTranscriptResponse) -> Self {
-        Self {
-            text_blocks: response
-                .text_blocks
-                .into_iter()
-                .map(|block| crate::transcript::TextBlock { text: block.text })
-                .collect(),
-            structured_result: response.structured_result,
-            remote_chat_id: response.remote_chat_id,
-        }
-    }
 }
 
 impl Session {
@@ -394,8 +236,9 @@ impl SessionHistory {
         self.append(session, SessionEntryKind::Error { message: message.0 })
     }
     pub fn complete(&self, session: &mut Session) -> Result<(), HistoryError> {
-        session.status = SessionStatus::Completed;
-        self.save(session)
+        self.update(session, |candidate| {
+            candidate.status = SessionStatus::Completed
+        })
     }
     pub fn list(&self) -> Result<Vec<Session>, HistoryError> {
         if !self.directory.exists() {
@@ -452,11 +295,24 @@ impl SessionHistory {
         }
     }
     fn append(&self, session: &mut Session, kind: SessionEntryKind) -> Result<(), HistoryError> {
-        session.entries.push(SessionEntry {
-            timestamp_ms: timestamp_ms(),
-            kind,
-        });
-        self.save(session)
+        self.update(session, |candidate| {
+            candidate.entries.push(SessionEntry {
+                timestamp_ms: timestamp_ms(),
+                kind,
+            });
+        })
+    }
+    /// Persist a staged candidate before exposing it to the caller.
+    fn update(
+        &self,
+        session: &mut Session,
+        mutation: impl FnOnce(&mut Session),
+    ) -> Result<(), HistoryError> {
+        let mut candidate = session.clone();
+        mutation(&mut candidate);
+        self.save(&mut candidate)?;
+        *session = candidate;
+        Ok(())
     }
     fn save(&self, session: &mut Session) -> Result<(), HistoryError> {
         fs::create_dir_all(&self.directory).map_err(|_| HistoryError::CreateDirectory {
