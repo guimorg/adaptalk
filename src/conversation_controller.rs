@@ -28,6 +28,10 @@ pub enum SubmitOutcome {
         response: TranscriptResponse,
         error: crate::session_history::HistoryError,
     },
+    ErrorWithPersistenceWarning {
+        error: anyhow::Error,
+        persistence_error: crate::session_history::HistoryError,
+    },
 }
 
 enum ConversationState<Q> {
@@ -39,6 +43,7 @@ enum ConversationState<Q> {
 struct ActiveConversation<Q> {
     query: Q,
     session: Session,
+    pending_response: Option<crate::session_history::RedactedTranscriptResponse>,
 }
 
 pub struct ConversationController<Q> {
@@ -103,6 +108,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         self.state = ConversationState::Connected(ActiveConversation {
             query: connection.query,
             session,
+            pending_response: None,
         });
         Ok(())
     }
@@ -115,16 +121,54 @@ impl<Q: ConversationQuery> ConversationController<Q> {
 
     pub fn finish(&mut self) -> Result<()> {
         if let ConversationState::Connected(active) = &mut self.state {
+            if active.pending_response.is_some() {
+                anyhow::bail!(
+                    "the last remote response is not persisted; retry persistence or abandon it before finishing"
+                );
+            }
             self.history.complete(&mut active.session)?;
             self.state = ConversationState::Disconnected;
         }
         Ok(())
     }
 
+    /// Retry the one remote response whose local persistence failed.
+    pub fn retry_pending_response(&mut self) -> Result<bool> {
+        let ConversationState::Connected(active) = &mut self.state else {
+            anyhow::bail!("a connection is required before retrying persistence");
+        };
+        let Some(response) = active.pending_response.take() else {
+            return Ok(false);
+        };
+        match self
+            .history
+            .append_response(&mut active.session, response.clone())
+        {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                active.pending_response = Some(response);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Explicitly discard an unpersisted response before abandoning the local session.
+    pub fn abandon_pending_response(&mut self) -> Result<bool> {
+        let ConversationState::Connected(active) = &mut self.state else {
+            anyhow::bail!("a connection is required before abandoning persistence");
+        };
+        Ok(active.pending_response.take().is_some())
+    }
+
     pub async fn submit(&mut self, prompt: &str) -> Result<SubmitOutcome> {
         let ConversationState::Connected(active) = &mut self.state else {
             anyhow::bail!("a connection is required before submitting a prompt");
         };
+        if active.pending_response.is_some() {
+            anyhow::bail!(
+                "the previous remote response could not be saved; retry persistence or abandon this session before submitting again"
+            );
+        }
         self.history
             .append_prompt(&mut active.session, self.redactor.transcript_text(prompt))?;
         let continuation = self.history.latest_remote_chat_id(&active.session)?;
@@ -132,20 +176,31 @@ impl<Q: ConversationQuery> ConversationController<Q> {
             Ok(response) => {
                 let response = self.redactor.transcript_response(response);
                 let display = response.as_inner().clone();
-                match self.history.append_response(&mut active.session, response) {
+                match self
+                    .history
+                    .append_response(&mut active.session, response.clone())
+                {
                     Ok(()) => Ok(SubmitOutcome::Response(display)),
-                    Err(error) => Ok(SubmitOutcome::ResponseWithPersistenceWarning {
-                        response: display,
-                        error,
-                    }),
+                    Err(error) => {
+                        active.pending_response = Some(response);
+                        Ok(SubmitOutcome::ResponseWithPersistenceWarning {
+                            response: display,
+                            error,
+                        })
+                    }
                 }
             }
             Err(error) => {
-                self.history.append_error(
+                match self.history.append_error(
                     &mut active.session,
                     self.redactor.transcript_text(&error.to_string()),
-                )?;
-                Err(error)
+                ) {
+                    Ok(()) => Err(error),
+                    Err(persistence_error) => Ok(SubmitOutcome::ErrorWithPersistenceWarning {
+                        error,
+                        persistence_error,
+                    }),
+                }
             }
         }
     }
@@ -301,6 +356,9 @@ mod tests {
             controller.submit("prompt").await.unwrap(),
             SubmitOutcome::ResponseWithPersistenceWarning { .. }
         ));
+        assert!(controller.submit("another prompt").await.is_err());
+        assert!(controller.finish().is_err());
+        assert!(controller.abandon_pending_response().unwrap());
         std::fs::remove_file(directory).unwrap();
     }
 

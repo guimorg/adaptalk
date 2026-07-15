@@ -7,7 +7,7 @@ A small Rust terminal REPL for using Adapt through its hosted MCP server.
 The project is intentionally starting as a thin Adapt client:
 
 - chat-first terminal interaction;
-- streamed responses when the MCP transport supports them;
+- completed responses rendered in the terminal;
 - capability discovery through Adapt's MCP server;
 - local session history under `.adapt/sessions/`;
 - bearer-token configuration under `.adapt/`, separate from history.

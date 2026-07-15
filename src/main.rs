@@ -43,7 +43,7 @@ impl ConversationQuery for TerminalQuery {
             } else {
                 self.client.query_read_only(prompt).await?
             };
-            transcript::from_query_response(response)
+            Ok(transcript::from_query_response(response))
         })
     }
 }
@@ -141,6 +141,15 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 render_response(&mut repl, response)?;
                 repl.show_notice(&format!(
                     "warning: response was received but could not be saved locally: {error}"
+                ))?;
+            }
+            Ok(SubmitOutcome::ErrorWithPersistenceWarning {
+                error,
+                persistence_error,
+            }) => {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(&format!(
+                    "warning: the error could not be saved locally: {persistence_error}"
                 ))?;
             }
             Err(error) => repl.show_error(&controller.redact(&error.to_string()))?,
@@ -279,7 +288,7 @@ mod tests {
             chat_id: None,
         };
         let transcript = Redactor::new("top-secret")
-            .transcript_response(transcript::from_query_response(response).unwrap())
+            .transcript_response(transcript::from_query_response(response))
             .into_inner();
         let stored = transcript.display_value().to_string();
         assert!(!stored.contains("top-secret"));

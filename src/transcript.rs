@@ -1,6 +1,5 @@
 //! Adapt's protocol-independent display contract and its protocol translator.
 
-use anyhow::Result;
 use rmcp::model::RawContent;
 
 use crate::adapt_client::QueryResponse;
@@ -25,14 +24,13 @@ impl TranscriptResponse {
         serde_json::json!({
             "text_blocks": self.text_blocks.iter().map(|block| &block.text).collect::<Vec<_>>(),
             "structured_result": self.structured_result,
-            "remote_chat_id": self.remote_chat_id,
         })
     }
 }
 
 /// Preserve text for the terminal and, when present, one opaque structured result.
 /// Protocol-specific fields such as citations deliberately do not escape this boundary.
-pub fn from_query_response(response: QueryResponse) -> Result<TranscriptResponse> {
+pub fn from_query_response(response: QueryResponse) -> TranscriptResponse {
     let text_blocks = response
         .content
         .into_iter()
@@ -43,11 +41,11 @@ pub fn from_query_response(response: QueryResponse) -> Result<TranscriptResponse
             },
         })
         .collect();
-    Ok(TranscriptResponse {
+    TranscriptResponse {
         text_blocks,
         structured_result: response.structured_content,
         remote_chat_id: response.chat_id,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -62,14 +60,14 @@ mod tests {
             content: vec![Content::new(RawContent::text("hello"), None)],
             structured_content: Some(serde_json::json!({"citations": ["source"]})),
             chat_id: Some("chat-1".into()),
-        })
-        .unwrap();
+        });
         assert_eq!(transcript.text_blocks[0].text, "hello");
         assert_eq!(
             transcript.structured_result,
             Some(serde_json::json!({"citations": ["source"]}))
         );
         assert_eq!(transcript.remote_chat_id.as_deref(), Some("chat-1"));
+        assert!(transcript.display_value().get("remote_chat_id").is_none());
     }
 
     #[test]
@@ -81,8 +79,7 @@ mod tests {
             )],
             structured_content: None,
             chat_id: None,
-        })
-        .unwrap();
+        });
 
         assert_eq!(
             transcript.text_blocks[0].text,
