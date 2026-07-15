@@ -58,7 +58,7 @@ Adapt currently exposes `ask_adapt`, which is not a verified read-only capabilit
 
 ### What to build
 
-Build the simple Crossterm Terminal REPL around the client boundary. Use normal terminal input and native scrollback, show a loading/completion fallback, and display structured results and citations inline. Progressive response streaming is deferred until Adapt's progress semantics are verified.
+Build the simple Crossterm Terminal REPL around the client boundary. Use normal terminal input and native scrollback, show a typing/completion fallback, and display structured results and citations inline. Until Adapt's progress semantics are verified, completed responses use local mock streaming by default and `/stream` can disable it.
 
 ### Acceptance criteria
 

@@ -11,6 +11,7 @@ use adapt_tui::{
 };
 use anyhow::Result;
 use clap::Parser;
+use std::time::Duration;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
@@ -94,6 +95,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut repl = Repl::start(allow_unverified_ask_adapt)?;
     let history = SessionHistory::for_credential_file(config::default_config_path()?);
     let mut controller = ConversationController::<TerminalQuery>::new(history);
+    let mut streaming_enabled = true;
     loop {
         let Some(prompt) = repl.read_prompt()? else {
             return controller.finish();
@@ -108,13 +110,21 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                     if let Some(session) = load_history(&mut repl, controller.history(), &id)? {
                         let opened = controller.open(session)?;
                         repl.clear_transcript()?;
-                        render_history(&mut repl, &opened)?;
+                        render_history(&mut repl, &opened).await?;
                         if controller.viewing_continuation()?.is_none() {
                             repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
                         } else if !allow_unverified_ask_adapt {
                             repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
                         }
                     }
+                }
+                ReplCommand::ToggleStreaming => {
+                    streaming_enabled = !streaming_enabled;
+                    repl.show_notice(if streaming_enabled {
+                        "Mock response streaming enabled."
+                    } else {
+                        "Mock response streaming disabled."
+                    })?;
                 }
                 ReplCommand::Unknown(message) => repl.show_error(&message)?,
             }
@@ -136,9 +146,11 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         }
         let result = controller.submit(&prompt).await;
         match result {
-            Ok(SubmitOutcome::Response(response)) => render_response(&mut repl, response)?,
+            Ok(SubmitOutcome::Response(response)) => {
+                render_response(&mut repl, response, streaming_enabled).await?
+            }
             Ok(SubmitOutcome::ResponseWithPersistenceWarning { response, error }) => {
-                render_response(&mut repl, response)?;
+                render_response(&mut repl, response, streaming_enabled).await?;
                 repl.show_notice(&format!(
                     "warning: response was received but could not be saved locally: {error}"
                 ))?;
@@ -189,7 +201,7 @@ fn load_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<O
         }
     }
 }
-fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
+async fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
     repl.show_notice(&format!(
         "Session {} · {}",
         session.id(),
@@ -198,15 +210,26 @@ fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
     for entry in session.entries() {
         match entry.kind() {
             SessionEntryKind::Prompt { text } => repl.show_you(text)?,
-            SessionEntryKind::Response(response) => render_response(repl, response.clone())?,
+            SessionEntryKind::Response(response) => {
+                render_response(repl, response.clone(), false).await?
+            }
             SessionEntryKind::Error { message } => repl.show_error(message)?,
         }
     }
     Ok(())
 }
-fn render_response(repl: &mut Repl, response: TranscriptResponse) -> Result<()> {
+async fn render_response(
+    repl: &mut Repl,
+    response: TranscriptResponse,
+    streaming_enabled: bool,
+) -> Result<()> {
     for block in response.text_blocks {
-        repl.show_adapt(&block.text)?;
+        if streaming_enabled {
+            repl.show_adapt_streaming(&block.text, Duration::from_millis(35))
+                .await?;
+        } else {
+            repl.show_adapt(&block.text)?;
+        }
     }
     if let Some(value) = response.structured_result {
         repl.show_structured_result(value)?;

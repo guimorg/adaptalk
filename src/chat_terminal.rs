@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 use crossterm::{
     cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
@@ -19,12 +20,14 @@ pub struct Repl {
 pub enum ReplCommand {
     History,
     Open(String),
+    ToggleStreaming,
     Unknown(String),
 }
 
-const COMMAND_PALETTE: [(&str, &str); 2] = [
+const COMMAND_PALETTE: [(&str, &str); 3] = [
     ("/history", "Browse saved local sessions"),
     ("/open <id>", "Reopen a saved transcript"),
+    ("/stream", "Toggle mock response streaming"),
 ];
 
 pub fn parse_command(input: &str) -> Option<ReplCommand> {
@@ -40,8 +43,9 @@ pub fn parse_command(input: &str) -> Option<ReplCommand> {
             Some(ReplCommand::Unknown("/open requires a session ID".into()))
         }
         Some(("/history", _)) | None if input == "/history" => Some(ReplCommand::History),
+        Some(("/stream", _)) | None if input == "/stream" => Some(ReplCommand::ToggleStreaming),
         _ => Some(ReplCommand::Unknown(format!(
-            "unknown command `{input}`; use /history or /open <id>"
+            "unknown command `{input}`; use /history, /open <id>, or /stream"
         ))),
     }
 }
@@ -162,7 +166,7 @@ impl Repl {
 
     pub fn show_working(&mut self) -> io::Result<()> {
         self.write_label("Adapt", Color::Yellow)?;
-        self.write_plain(": is working…\r\n")?;
+        self.write_plain(": is typing…\r\n")?;
         self.waiting = true;
         Ok(())
     }
@@ -178,6 +182,21 @@ impl Repl {
     pub fn show_adapt(&mut self, message: &str) -> io::Result<()> {
         self.clear_working()?;
         self.write_message("Adapt", Color::Magenta, message)
+    }
+
+    pub async fn show_adapt_streaming(&mut self, message: &str, delay: Duration) -> io::Result<()> {
+        self.clear_working()?;
+        self.write_label("Adapt", Color::Magenta)?;
+        self.write_plain(": ")?;
+
+        let chunks = streaming_chunks(message);
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.write_plain(chunk)?;
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        self.write_plain("\r\n")
     }
 
     pub fn show_structured_result(&mut self, value: Value) -> io::Result<()> {
@@ -330,15 +349,45 @@ fn completed_command(input: &str) -> Option<String> {
     })
 }
 
+fn streaming_chunks(message: &str) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut leading_whitespace = String::new();
+
+    for segment in message.split_inclusive(char::is_whitespace) {
+        if segment.chars().all(char::is_whitespace) {
+            if let Some(last) = chunks.last_mut() {
+                last.push_str(segment);
+            } else {
+                leading_whitespace.push_str(segment);
+            }
+        } else {
+            chunks.push(format!("{leading_whitespace}{segment}"));
+            leading_whitespace.clear();
+        }
+    }
+
+    if !leading_whitespace.is_empty() {
+        if let Some(last) = chunks.last_mut() {
+            last.push_str(&leading_whitespace);
+        } else {
+            chunks.push(leading_whitespace);
+        }
+    }
+
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ReplCommand, completed_command, matching_commands, parse_command, shows_command_palette,
+        streaming_chunks,
     };
 
     #[test]
     fn recognizes_history_and_open_commands() {
         assert_eq!(parse_command("/history"), Some(ReplCommand::History));
+        assert_eq!(parse_command("/stream"), Some(ReplCommand::ToggleStreaming));
         assert_eq!(
             parse_command("/open abc"),
             Some(ReplCommand::Open("abc".into()))
@@ -355,6 +404,7 @@ mod tests {
         assert!(shows_command_palette("/his"));
         assert!(shows_command_palette("/ope"));
         assert!(shows_command_palette("/history"));
+        assert!(shows_command_palette("/stream"));
         assert!(!shows_command_palette("/unknown"));
         assert!(!shows_command_palette(""));
         assert!(!shows_command_palette("ask Adapt"));
@@ -383,5 +433,19 @@ mod tests {
         assert_eq!(completed_command("/his"), Some("/history".into()));
         assert_eq!(completed_command("/pn"), Some("/open ".into()));
         assert_eq!(completed_command("/history"), None);
+    }
+
+    #[test]
+    fn streaming_chunks_keep_word_boundaries_and_whitespace() {
+        assert_eq!(
+            streaming_chunks("Hello,  world\nfrom Adapt"),
+            vec!["Hello,  ", "world\n", "from ", "Adapt"]
+        );
+    }
+
+    #[test]
+    fn streaming_chunks_handle_empty_and_whitespace_only_messages() {
+        assert!(streaming_chunks("").is_empty());
+        assert_eq!(streaming_chunks("  \n"), vec!["  \n"]);
     }
 }

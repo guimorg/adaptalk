@@ -70,8 +70,9 @@ Two REPL commands work entirely locally, before any configuration is read or MCP
 
 - `/history` lists saved sessions with their ID, status, and first-prompt summary.
 - `/open <id>` saves the active transcript, clears the terminal, and renders the selected transcript. The next prompt starts a new local snapshot linked to it. With `--allow-unverified-ask-adapt`, that prompt also sends the saved Adapt chat ID to continue the remote conversation; normal read-only mode never does.
+- `/stream` toggles mock response streaming for new replies. It is enabled by default and reveals completed responses in word-sized chunks; reopened transcripts render immediately.
 
-Type `/` at the prompt to see these commands in a compact suggestion palette. Fuzzy matches can be accepted with Tab or Enter before supplying `/open`'s session ID.
+Type `/` at the prompt to see these commands in a compact suggestion palette. Fuzzy matches can be accepted with Tab or Enter before supplying `/open`'s session ID. Mock streaming is a terminal presentation effect; real MCP progress-event streaming is not enabled yet.
 
 The connectivity milestone initializes against Adapt's hosted endpoint and discovers its capabilities. The client query seam accepts a prompt, invokes only a selected verified read-only capability, and preserves structured MCP results for the terminal layer.
 
