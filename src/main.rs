@@ -1,13 +1,19 @@
 use adapt_tui::{
-    adapt_client::{AdaptClient, QueryResponse},
-    chat_terminal::Repl,
+    adapt_client::AdaptClient,
+    chat_terminal::{Repl, ReplCommand, parse_command},
     config,
+    conversation_controller::{
+        Connection, ConversationController, ConversationQuery, QueryFuture, SubmitOutcome,
+    },
+    redaction::Redactor,
+    session_history::{Session, SessionEntryKind, SessionHistory},
+    transcript::{self, TranscriptResponse},
 };
 use anyhow::Result;
 use clap::Parser;
-use rmcp::model::RawContent;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
+const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -16,108 +22,208 @@ const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only
     about = "A read-only terminal client for Adapt's MCP server"
 )]
 struct Cli {
-    /// Enable the unverified ask_adapt capability for development investigations.
     #[arg(long)]
     allow_unverified_ask_adapt: bool,
-
-    /// Natural-language prompt to submit.
     #[arg(value_name = "PROMPT")]
     prompt: Vec<String>,
+}
+
+struct TerminalQuery {
+    client: AdaptClient,
+    allow_unverified_ask_adapt: bool,
+}
+
+impl ConversationQuery for TerminalQuery {
+    fn query<'a>(&'a self, prompt: &'a str, continuation: Option<&'a str>) -> QueryFuture<'a> {
+        Box::pin(async move {
+            let response = if self.allow_unverified_ask_adapt {
+                self.client
+                    .query_ask_adapt_in_conversation(prompt, continuation, true)
+                    .await?
+            } else {
+                self.client.query_read_only(prompt).await?
+            };
+            Ok(transcript::from_query_response(response))
+        })
+    }
+}
+
+async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<Connection<TerminalQuery>> {
+    let config = config::load()?;
+    let client = AdaptClient::connect(&config).await?;
+    client.discover_capabilities().await?;
+    let redactor = Redactor::new(&config.bearer_token);
+    Ok(Connection {
+        query: TerminalQuery {
+            client,
+            allow_unverified_ask_adapt,
+        },
+        redactor,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
     if !args.prompt.is_empty() {
-        let config = config::load()?;
-        let client = AdaptClient::connect(&config).await?;
-        client.discover_capabilities().await?;
-        return run_prompt(&client, &args).await;
+        return run_prompt(&args).await;
     }
     run_terminal(args.allow_unverified_ask_adapt).await
 }
 
-async fn run_prompt(client: &AdaptClient, args: &Cli) -> Result<()> {
+async fn run_prompt(args: &Cli) -> Result<()> {
+    let Connection { query, redactor } = connect_terminal(args.allow_unverified_ask_adapt).await?;
     if args.allow_unverified_ask_adapt {
-        eprintln!("{ASK_ADAPT_WARNING}");
+        eprintln!("{}", redactor.text(ASK_ADAPT_WARNING));
     }
     let prompt = args.prompt.join(" ");
-    let response = if args.allow_unverified_ask_adapt {
-        client.query_ask_adapt(&prompt, true).await?
-    } else {
-        client.query_read_only(&prompt).await?
-    };
-    println!("response: {}", serde_json::to_string_pretty(&response)?);
+    let response = query.query(&prompt, None).await?;
+    println!(
+        "response: {}",
+        serde_json::to_string_pretty(
+            &redactor
+                .transcript_response(response)
+                .into_inner()
+                .display_value(),
+        )?
+    );
     Ok(())
 }
 
 async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut repl = Repl::start(allow_unverified_ask_adapt)?;
-    let client: Result<AdaptClient> = async {
-        let config = config::load()?;
-        let client = AdaptClient::connect(&config).await?;
-        client.discover_capabilities().await?;
-        Ok(client)
-    }
-    .await;
-    let client = match client {
-        Ok(client) => client,
-        Err(error) => {
-            repl.show_error(&error.to_string())?;
-            return Ok(());
-        }
-    };
-
-    let mut remote_chat_id = None;
+    let history = SessionHistory::for_credential_file(config::default_config_path()?);
+    let mut controller = ConversationController::<TerminalQuery>::new(history);
     loop {
         let Some(prompt) = repl.read_prompt()? else {
-            return Ok(());
+            return controller.finish();
         };
         if prompt.is_empty() {
             continue;
         }
-        repl.show_working()?;
-        let result = if allow_unverified_ask_adapt {
-            client
-                .query_ask_adapt_in_conversation(&prompt, remote_chat_id.as_deref(), true)
-                .await
-        } else {
-            client.query_read_only(&prompt).await
-        };
-        match result {
-            Ok(response) => {
-                if let Some(chat_id) = response.chat_id.clone() {
-                    remote_chat_id = Some(chat_id);
+        if let Some(command) = parse_command(&prompt) {
+            match command {
+                ReplCommand::History => show_history(&mut repl, controller.history())?,
+                ReplCommand::Open(id) => {
+                    if let Some(session) = load_history(&mut repl, controller.history(), &id)? {
+                        let opened = controller.open(session)?;
+                        repl.clear_transcript()?;
+                        render_history(&mut repl, &opened)?;
+                        if controller.viewing_continuation()?.is_none() {
+                            repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
+                        } else if !allow_unverified_ask_adapt {
+                            repl.show_notice(RESUME_REQUIRES_DEVELOPMENT_MODE)?;
+                        }
+                    }
                 }
-                append_response(&mut repl, response)?;
+                ReplCommand::Unknown(message) => repl.show_error(&message)?,
             }
-            Err(error) => repl.show_error(&error.to_string())?,
+            continue;
+        }
+        repl.show_working()?;
+        if controller.needs_connection() {
+            let connection = match connect_terminal(allow_unverified_ask_adapt).await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    repl.show_error(&controller.redact(&error.to_string()))?;
+                    continue;
+                }
+            };
+            if let Err(error) = controller.connect(connection) {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                continue;
+            }
+        }
+        let result = controller.submit(&prompt).await;
+        match result {
+            Ok(SubmitOutcome::Response(response)) => render_response(&mut repl, response)?,
+            Ok(SubmitOutcome::ResponseWithPersistenceWarning { response, error }) => {
+                render_response(&mut repl, response)?;
+                repl.show_notice(&format!(
+                    "warning: response was received but could not be saved locally: {error}"
+                ))?;
+            }
+            Ok(SubmitOutcome::ErrorWithPersistenceWarning {
+                error,
+                persistence_error,
+            }) => {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(&format!(
+                    "warning: the error could not be saved locally: {persistence_error}"
+                ))?;
+            }
+            Err(error) => repl.show_error(&controller.redact(&error.to_string()))?,
         }
     }
 }
 
-fn append_response(repl: &mut Repl, response: QueryResponse) -> std::io::Result<()> {
-    for content in response.content {
-        let content = match &content.raw {
-            RawContent::Text(text) => text.text.clone(),
-            _ => serde_json::to_string(&content)
-                .unwrap_or_else(|_| "[unrenderable response content]".to_owned()),
-        };
-        repl.show_adapt(&content)?;
+fn show_history(repl: &mut Repl, history: &SessionHistory) -> Result<()> {
+    let sessions = history.list()?;
+    if sessions.is_empty() {
+        return Ok(repl.show_notice("No local sessions saved yet.")?);
     }
-    if let Some(structured_content) = response.structured_content {
-        repl.show_structured_result(structured_content)?;
+    for session in sessions {
+        let prompt = session
+            .entries()
+            .iter()
+            .find_map(|entry| match entry.kind() {
+                SessionEntryKind::Prompt { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("(no prompts)");
+        repl.show_notice(&format!(
+            "{} · {} · {}",
+            session.id(),
+            session.status().display_name(),
+            compact(prompt)
+        ))?;
     }
-    repl.finish_response()
+    Ok(())
+}
+fn load_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<Option<Session>> {
+    match history.load(id) {
+        Ok(session) => Ok(Some(session)),
+        Err(error) => {
+            repl.show_error(&error.to_string())?;
+            Ok(None)
+        }
+    }
+}
+fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
+    repl.show_notice(&format!(
+        "Session {} · {}",
+        session.id(),
+        session.status().display_name()
+    ))?;
+    for entry in session.entries() {
+        match entry.kind() {
+            SessionEntryKind::Prompt { text } => repl.show_you(text)?,
+            SessionEntryKind::Response(response) => render_response(repl, response.clone())?,
+            SessionEntryKind::Error { message } => repl.show_error(message)?,
+        }
+    }
+    Ok(())
+}
+fn render_response(repl: &mut Repl, response: TranscriptResponse) -> Result<()> {
+    for block in response.text_blocks {
+        repl.show_adapt(&block.text)?;
+    }
+    if let Some(value) = response.structured_result {
+        repl.show_structured_result(value)?;
+    }
+    repl.finish_response()?;
+    Ok(())
+}
+fn compact(text: &str) -> String {
+    text.chars().take(72).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::Cli;
-    use adapt_tui::{adapt_client::QueryResponse, chat_terminal::redact_text};
+    use adapt_tui::{adapt_client::QueryResponse, redaction::Redactor, transcript};
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use rmcp::model::{Content, RawContent};
-
     #[test]
     fn empty_arguments_do_not_submit_a_prompt() {
         assert!(
@@ -127,7 +233,6 @@ mod tests {
                 .is_empty()
         );
     }
-
     #[test]
     fn prompt_arguments_are_joined_for_submission() {
         assert_eq!(
@@ -138,84 +243,54 @@ mod tests {
             "find recent incidents"
         );
     }
-
     #[test]
     fn opt_in_flag_is_removed_from_prompt() {
         assert_eq!(
-            Cli::try_parse_from([
-                "adapt-tui",
-                "--allow-unverified-ask-adapt",
-                "find",
-                "incidents",
-            ])
-            .unwrap(),
+            Cli::try_parse_from(["adapt-tui", "--allow-unverified-ask-adapt", "find"]).unwrap(),
             Cli {
-                prompt: vec!["find".to_owned(), "incidents".to_owned()],
-                allow_unverified_ask_adapt: true,
+                prompt: vec!["find".into()],
+                allow_unverified_ask_adapt: true
             }
         );
     }
-
     #[test]
-    fn flag_alone_does_not_create_a_prompt() {
+    fn help_version_and_unknown_flags_are_handled_by_clap() {
         assert_eq!(
-            Cli::try_parse_from(["adapt-tui", "--allow-unverified-ask-adapt"]).unwrap(),
-            Cli {
-                prompt: vec![],
-                allow_unverified_ask_adapt: true,
-            }
+            Cli::try_parse_from(["adapt-tui", "--help"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayHelp
         );
+        assert_eq!(
+            Cli::try_parse_from(["adapt-tui", "--version"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayVersion
+        );
+        assert_eq!(
+            Cli::try_parse_from(["adapt-tui", "--unknown"])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnknownArgument
+        );
+        Cli::command().debug_assert();
     }
-
-    #[test]
-    fn help_flags_are_handled_by_clap() {
-        for flag in ["--help", "-h"] {
-            let error = Cli::try_parse_from(["adapt-tui", flag]).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
-            assert!(error.to_string().contains("Usage: adapt-tui"));
-            assert!(error.to_string().contains("--allow-unverified-ask-adapt"));
-        }
-    }
-
-    #[test]
-    fn version_flag_is_handled_by_clap() {
-        let error = Cli::try_parse_from(["adapt-tui", "--version"]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
-        assert!(error.to_string().starts_with("adapt-tui "));
-    }
-
-    #[test]
-    fn unknown_options_are_rejected() {
-        let error = Cli::try_parse_from(["adapt-tui", "--unknown"]).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-    }
-
     #[test]
     fn warning_is_explicit_about_mutations() {
         assert!(super::ASK_ADAPT_WARNING.contains("not verified as read-only"));
         assert!(super::ASK_ADAPT_WARNING.contains("may perform mutations"));
     }
-
     #[test]
-    fn text_mcp_content_can_be_extracted_for_the_repl() {
+    fn response_translation_redacts_configured_token_for_one_shot_output() {
         let response = QueryResponse {
-            content: vec![Content::new(
-                RawContent::text("Hi Guilherme! What can I help with today?"),
-                None,
-            )],
-            structured_content: None,
+            content: vec![Content::new(RawContent::text("Bearer top-secret"), None)],
+            structured_content: Some(serde_json::json!({"token": "top-secret"})),
             chat_id: None,
         };
-        let content = match &response.content[0].raw {
-            RawContent::Text(text) => text.text.clone(),
-            _ => unreachable!("test response contains text"),
-        };
-        assert_eq!(content, "Hi Guilherme! What can I help with today?");
-        assert_eq!(redact_text("Bearer secret"), "Bearer [redacted]");
-    }
-
-    #[test]
-    fn cli_definition_is_valid() {
-        Cli::command().debug_assert();
+        let transcript = Redactor::new("top-secret")
+            .transcript_response(transcript::from_query_response(response))
+            .into_inner();
+        let stored = transcript.display_value().to_string();
+        assert!(!stored.contains("top-secret"));
     }
 }

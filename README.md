@@ -7,7 +7,7 @@ A small Rust terminal REPL for using Adapt through its hosted MCP server.
 The project is intentionally starting as a thin Adapt client:
 
 - chat-first terminal interaction;
-- streamed responses when the MCP transport supports them;
+- completed responses rendered in the terminal;
 - capability discovery through Adapt's MCP server;
 - local session history under `.adapt/sessions/`;
 - bearer-token configuration under `.adapt/`, separate from history.
@@ -63,6 +63,15 @@ AdaptTUI first connects to the Adapt MCP Server and discovers capabilities, then
 - Use your terminal's normal scrolling controls to browse the conversation.
 - Press Ctrl-C to exit.
 - AdaptTUI invokes only capabilities verified as read-only. If none are available, the terminal displays that error rather than invoking an ambiguous capability.
+
+After a successful connection, AdaptTUI saves a redacted JSON snapshot after every prompt and response in `~/.adapt/sessions/` (next to, but separate from, `~/.adapt/config.toml`). A session left running by Ctrl-C or process termination is shown as **interrupted** and can still be read. The configured bearer token, bearer strings, and common sensitive JSON fields are redacted before anything is written.
+
+Two REPL commands work entirely locally, before any configuration is read or MCP connection is made:
+
+- `/history` lists saved sessions with their ID, status, and first-prompt summary.
+- `/open <id>` saves the active transcript, clears the terminal, and renders the selected transcript. The next prompt starts a new local snapshot linked to it. With `--allow-unverified-ask-adapt`, that prompt also sends the saved Adapt chat ID to continue the remote conversation; normal read-only mode never does.
+
+Type `/` at the prompt to see these commands in a compact suggestion palette. Fuzzy matches can be accepted with Tab or Enter before supplying `/open`'s session ID.
 
 The connectivity milestone initializes against Adapt's hosted endpoint and discovers its capabilities. The client query seam accepts a prompt, invokes only a selected verified read-only capability, and preserves structured MCP results for the terminal layer.
 
