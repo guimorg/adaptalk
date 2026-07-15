@@ -12,7 +12,7 @@ An Adapt remote chat identifier is returned with a response and needed only for 
 
 Persist the identifier only in the response transcript entry. The conversation controller derives the continuation value from the most recent response whenever it submits a prompt. Local session creation records only lineage through `resumed_from_session_id`.
 
-The controller receives an already-connected query adapter and returns explicit render intents. Connection/configuration remains terminal wiring, so a failed connection cannot disturb a history-viewing state.
+The controller receives an already-connected query adapter and returns a viewed session or submission outcome. Connection/configuration remains terminal wiring, so a failed connection cannot disturb a history-viewing state.
 
 ## Consequences
 
