@@ -267,10 +267,14 @@ impl SessionHistory {
     }
     pub fn load(&self, id: &str) -> Result<Session, HistoryError> {
         let id = SessionId::parse(id)?;
-        load_file(&self.path_for(&id)).map_err(|error| match error {
-            HistoryError::Read { .. } => HistoryError::NotFound { id: id.to_string() },
-            other => other,
-        })
+        let path = self.path_for(&id);
+        match fs::metadata(&path) {
+            Ok(_) => load_file(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(HistoryError::NotFound { id: id.to_string() })
+            }
+            Err(_) => Err(HistoryError::Read { path }),
+        }
     }
     /// Resolve continuation from this session's responses, then its immutable lineage.
     ///
@@ -404,6 +408,22 @@ mod tests {
                 Err(HistoryError::InvalidId { .. })
             ));
         }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn missing_sessions_are_distinct_from_unreadable_sessions() {
+        let (history, directory) = history("load-errors");
+        assert!(matches!(
+            history.load("1-2-3"),
+            Err(HistoryError::NotFound { .. })
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir(directory.join("1-2-3.json")).unwrap();
+        assert!(matches!(
+            history.load("1-2-3"),
+            Err(HistoryError::Read { .. })
+        ));
         let _ = fs::remove_dir_all(directory);
     }
     #[test]

@@ -10,8 +10,8 @@ use crossterm::{
 };
 use serde_json::Value;
 
-pub struct Repl {
-    stdout: io::Stdout,
+pub struct Repl<W: Write = io::Stdout> {
+    stdout: W,
     waiting: bool,
     unverified_development_mode: bool,
 }
@@ -87,7 +87,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-impl Repl {
+impl Repl<io::Stdout> {
     pub fn start(unverified_development_mode: bool) -> io::Result<Self> {
         let mut repl = Self {
             stdout: io::stdout(),
@@ -96,6 +96,22 @@ impl Repl {
         };
         repl.clear_transcript()?;
         Ok(repl)
+    }
+}
+
+impl<W: Write> Repl<W> {
+    pub fn with_output(stdout: W, unverified_development_mode: bool) -> io::Result<Self> {
+        let mut repl = Self {
+            stdout,
+            waiting: false,
+            unverified_development_mode,
+        };
+        repl.clear_transcript()?;
+        Ok(repl)
+    }
+
+    pub fn into_output(self) -> W {
+        self.stdout
     }
 
     pub fn clear_transcript(&mut self) -> io::Result<()> {
@@ -186,17 +202,17 @@ impl Repl {
 
     pub async fn show_adapt_streaming(&mut self, message: &str, delay: Duration) -> io::Result<()> {
         self.clear_working()?;
-        self.write_label("Adapt", Color::Magenta)?;
-        self.write_plain(": ")?;
+        let mut writer = LineAwareMessageWriter::start(&mut self.stdout, "Adapt", Color::Magenta)?;
 
         let chunks = streaming_chunks(message);
         for (index, chunk) in chunks.iter().enumerate() {
-            self.write_plain(chunk)?;
+            writer.write_text(chunk)?;
+            writer.flush()?;
             if index + 1 < chunks.len() {
                 tokio::time::sleep(delay).await;
             }
         }
-        self.write_plain("\r\n")
+        writer.finish()
     }
 
     pub fn show_structured_result(&mut self, value: Value) -> io::Result<()> {
@@ -279,22 +295,9 @@ impl Repl {
     }
 
     fn write_message(&mut self, label: &str, color: Color, message: &str) -> io::Result<()> {
-        let mut lines = message.lines();
-        if let Some(first_line) = lines.next() {
-            self.write_label(label, color)?;
-            self.write_plain(": ")?;
-            self.write_plain(first_line)?;
-            self.write_plain("\r\n")?;
-        } else {
-            self.write_label(label, color)?;
-            self.write_plain(":\r\n")?;
-        }
-        for line in lines {
-            self.write_plain("  ")?;
-            self.write_plain(line)?;
-            self.write_plain("\r\n")?;
-        }
-        self.stdout.flush()
+        let mut writer = LineAwareMessageWriter::start(&mut self.stdout, label, color)?;
+        writer.write_text(message)?;
+        writer.finish()
     }
 
     fn write_label(&mut self, label: &str, color: Color) -> io::Result<()> {
@@ -318,6 +321,59 @@ impl Repl {
     fn write_plain(&mut self, text: &str) -> io::Result<()> {
         write!(self.stdout, "{text}")?;
         self.stdout.flush()
+    }
+}
+
+struct LineAwareMessageWriter<'a, W: Write> {
+    output: &'a mut W,
+    at_line_start: bool,
+    ended_with_newline: bool,
+}
+
+impl<'a, W: Write> LineAwareMessageWriter<'a, W> {
+    fn start(output: &'a mut W, label: &str, color: Color) -> io::Result<Self> {
+        execute!(
+            output,
+            SetForegroundColor(color),
+            SetAttribute(Attribute::Bold)
+        )?;
+        write!(output, "{label}")?;
+        execute!(output, SetAttribute(Attribute::Reset))?;
+        write!(output, ": ")?;
+        Ok(Self {
+            output,
+            at_line_start: false,
+            ended_with_newline: false,
+        })
+    }
+
+    fn write_text(&mut self, text: &str) -> io::Result<()> {
+        for character in text.chars() {
+            if character == '\n' {
+                write!(self.output, "\r\n")?;
+                self.at_line_start = true;
+                self.ended_with_newline = true;
+            } else {
+                if self.at_line_start {
+                    write!(self.output, "  ")?;
+                }
+                write!(self.output, "{character}")?;
+                self.at_line_start = false;
+                self.ended_with_newline = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if !self.ended_with_newline {
+            write!(self.output, "\r\n")?;
+        }
+        self.output.flush()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
     }
 }
 
@@ -379,6 +435,8 @@ fn streaming_chunks(message: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         ReplCommand, completed_command, matching_commands, parse_command, shows_command_palette,
         streaming_chunks,
@@ -447,5 +505,49 @@ mod tests {
     fn streaming_chunks_handle_empty_and_whitespace_only_messages() {
         assert!(streaming_chunks("").is_empty());
         assert_eq!(streaming_chunks("  \n"), vec!["  \n"]);
+    }
+
+    #[test]
+    fn renders_typing_indicator_at_the_user_visible_seam() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_working().unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("Adapt: is typing…\r\n"));
+    }
+
+    #[test]
+    fn immediate_multiline_output_indents_continuation_lines() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_adapt("first\nsecond").unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("Adapt: first\r\n  second\r\n"));
+    }
+
+    #[tokio::test]
+    async fn streamed_multiline_output_uses_the_same_line_formatting() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_adapt_streaming("first\nsecond", Duration::ZERO)
+            .await
+            .unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("Adapt: first\r\n  second\r\n"));
+    }
+
+    fn visible(output: &[u8]) -> String {
+        let text = String::from_utf8_lossy(output);
+        let mut visible = String::new();
+        let mut in_escape = false;
+        for character in text.chars() {
+            if in_escape {
+                if character.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if character == '\x1b' {
+                in_escape = true;
+            } else {
+                visible.push(character);
+            }
+        }
+        visible
     }
 }
