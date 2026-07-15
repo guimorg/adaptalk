@@ -16,7 +16,7 @@ src/
 
 docs/
   specs/
-    adapt-tui-issues.md      # ATUI-1 through ATUI-6 slices
+    adaptalk-issues.md       # ATUI-1 through ATUI-6 slices
   adr/
     0001-*.md                # Architecture decisions
 ```
@@ -74,7 +74,7 @@ nix develop
 Build with Nix:
 ```bash
 nix build
-# Binary at result/bin/adapt-tui
+# Binary at result/bin/adaptalk
 ```
 
 ## Releasing

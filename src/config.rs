@@ -112,7 +112,7 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<AdaptConfig, ConfigError> {
 mod tests {
     use super::*;
     fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("adapt-tui-{name}-{}.toml", std::process::id()))
+        std::env::temp_dir().join(format!("adaptalk-{name}-{}.toml", std::process::id()))
     }
     #[test]
     fn defaults_endpoint() {

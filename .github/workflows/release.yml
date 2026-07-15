@@ -26,8 +26,8 @@ jobs:
 
       - name: Rename binary
         run: |
-          BINARY_NAME="adapt-tui-$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
-          mv target/release/adapt-tui "$BINARY_NAME"
+          BINARY_NAME="adaptalk-$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
+          mv target/release/adaptalk "$BINARY_NAME"
           echo "BINARY_NAME=$BINARY_NAME" >> $GITHUB_ENV
 
       - name: Create Release

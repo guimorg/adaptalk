@@ -14,7 +14,7 @@
 
     packages = forAllSystems (pkgs: {
       default = pkgs.rustPlatform.buildRustPackage {
-        pname = "adapt-tui";
+        pname = "adaptalk";
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
@@ -36,8 +36,8 @@
 
         shellHook = ''
           export PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-          echo "adapt-tui development environment"
-          echo "  cargo run       # launch the scaffold"
+          echo "adaptalk development environment"
+          echo "  cargo run       # launch the REPL"
           echo "  cargo test      # run tests"
           echo "  just check      # format, lint, and test"
         '';
