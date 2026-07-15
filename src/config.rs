@@ -1,17 +1,20 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
 use thiserror::Error;
 
 pub const DEFAULT_ADAPT_ENDPOINT: &str = "https://app.adapt.com/mcp";
+pub const DEFAULT_STREAM_DELAY_MS: u64 = 35;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdaptConfig {
     pub bearer_token: String,
     pub endpoint: String,
+    pub stream_delay: Duration,
     pub source: PathBuf,
 }
 
@@ -20,6 +23,7 @@ impl std::fmt::Debug for AdaptConfig {
         f.debug_struct("AdaptConfig")
             .field("bearer_token", &"[redacted]")
             .field("endpoint", &self.endpoint)
+            .field("stream_delay_ms", &self.stream_delay.as_millis())
             .field("source", &self.source)
             .finish()
     }
@@ -35,6 +39,10 @@ pub enum ConfigError {
     MissingToken { path: PathBuf },
     #[error("Adapt configuration at {path} has an invalid endpoint")]
     InvalidEndpoint { path: PathBuf },
+    #[error(
+        "Adapt configuration at {path} has an invalid stream_delay_ms; use zero or a positive integer"
+    )]
+    InvalidStreamDelay { path: PathBuf },
     #[error("could not read Adapt configuration at {path}")]
     Read { path: PathBuf },
 }
@@ -43,6 +51,7 @@ pub enum ConfigError {
 struct FileConfig {
     bearer_token: Option<String>,
     endpoint: Option<String>,
+    stream_delay_ms: Option<i64>,
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
@@ -79,9 +88,16 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<AdaptConfig, ConfigError> {
     if !endpoint.starts_with("https://") {
         return Err(ConfigError::InvalidEndpoint { path });
     }
+    let stream_delay_ms = parsed
+        .stream_delay_ms
+        .unwrap_or(DEFAULT_STREAM_DELAY_MS as i64);
+    if stream_delay_ms < 0 {
+        return Err(ConfigError::InvalidStreamDelay { path });
+    }
     Ok(AdaptConfig {
         bearer_token: token,
         endpoint,
+        stream_delay: Duration::from_millis(stream_delay_ms as u64),
         source: path,
     })
 }
@@ -99,6 +115,10 @@ mod tests {
         let c = load_from(&p).unwrap();
         assert_eq!(DEFAULT_ADAPT_ENDPOINT, "https://app.adapt.com/mcp");
         assert_eq!(c.endpoint, DEFAULT_ADAPT_ENDPOINT);
+        assert_eq!(
+            c.stream_delay,
+            Duration::from_millis(DEFAULT_STREAM_DELAY_MS)
+        );
         assert!(!format!("{c:?}").contains("secret"));
         let _ = fs::remove_file(p);
     }
@@ -113,6 +133,17 @@ mod tests {
         assert_eq!(
             load_from(&p).unwrap().endpoint,
             "https://staging.example/mcp"
+        );
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn override_stream_delay() {
+        let p = path("stream-delay");
+        fs::write(&p, "bearer_token='s'\nstream_delay_ms=120").unwrap();
+        assert_eq!(
+            load_from(&p).unwrap().stream_delay,
+            Duration::from_millis(120)
         );
         let _ = fs::remove_file(p);
     }
@@ -142,6 +173,17 @@ mod tests {
         assert!(matches!(
             load_from(&p),
             Err(ConfigError::InvalidEndpoint { .. })
+        ));
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn rejects_negative_stream_delay() {
+        let p = path("negative-stream-delay");
+        fs::write(&p, "bearer_token='s'\nstream_delay_ms=-1").unwrap();
+        assert!(matches!(
+            load_from(&p),
+            Err(ConfigError::InvalidStreamDelay { .. })
         ));
         let _ = fs::remove_file(p);
     }

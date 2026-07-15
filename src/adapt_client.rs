@@ -438,6 +438,7 @@ mod tests {
         let config = AdaptConfig {
             bearer_token: "session-token".into(),
             endpoint: "https://app.adapt.com/mcp".into(),
+            stream_delay: std::time::Duration::from_millis(35),
             source: "/tmp/config.toml".into(),
         };
         assert_eq!(

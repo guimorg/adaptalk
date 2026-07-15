@@ -49,18 +49,24 @@ impl ConversationQuery for TerminalQuery {
     }
 }
 
-async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<Connection<TerminalQuery>> {
+async fn connect_terminal(
+    allow_unverified_ask_adapt: bool,
+) -> Result<(Connection<TerminalQuery>, Duration)> {
     let config = config::load()?;
+    let stream_delay = config.stream_delay;
     let client = AdaptClient::connect(&config).await?;
     client.discover_capabilities().await?;
     let redactor = Redactor::new(&config.bearer_token);
-    Ok(Connection {
-        query: TerminalQuery {
-            client,
-            allow_unverified_ask_adapt,
+    Ok((
+        Connection {
+            query: TerminalQuery {
+                client,
+                allow_unverified_ask_adapt,
+            },
+            redactor,
         },
-        redactor,
-    })
+        stream_delay,
+    ))
 }
 
 #[tokio::main]
@@ -73,7 +79,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_prompt(args: &Cli) -> Result<()> {
-    let Connection { query, redactor } = connect_terminal(args.allow_unverified_ask_adapt).await?;
+    let (Connection { query, redactor }, _) =
+        connect_terminal(args.allow_unverified_ask_adapt).await?;
     if args.allow_unverified_ask_adapt {
         eprintln!("{}", redactor.text(ASK_ADAPT_WARNING));
     }
@@ -96,6 +103,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let history = SessionHistory::for_credential_file(config::default_config_path()?);
     let mut controller = ConversationController::<TerminalQuery>::new(history);
     let mut streaming_enabled = true;
+    let mut stream_delay = Duration::from_millis(config::DEFAULT_STREAM_DELAY_MS);
     loop {
         let Some(prompt) = repl.read_prompt()? else {
             return controller.finish();
@@ -132,13 +140,15 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         }
         repl.show_working()?;
         if controller.needs_connection() {
-            let connection = match connect_terminal(allow_unverified_ask_adapt).await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    repl.show_error(&controller.redact(&error.to_string()))?;
-                    continue;
-                }
-            };
+            let (connection, configured_delay) =
+                match connect_terminal(allow_unverified_ask_adapt).await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        repl.show_error(&controller.redact(&error.to_string()))?;
+                        continue;
+                    }
+                };
+            stream_delay = configured_delay;
             if let Err(error) = controller.connect(connection) {
                 repl.show_error(&controller.redact(&error.to_string()))?;
                 continue;
@@ -147,10 +157,10 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
         let result = controller.submit(&prompt).await;
         match result {
             Ok(SubmitOutcome::Response(response)) => {
-                render_response(&mut repl, response, streaming_enabled).await?
+                render_response(&mut repl, response, streaming_enabled, stream_delay).await?
             }
             Ok(SubmitOutcome::ResponseWithPersistenceWarning { response, error }) => {
-                render_response(&mut repl, response, streaming_enabled).await?;
+                render_response(&mut repl, response, streaming_enabled, stream_delay).await?;
                 repl.show_notice(&format!(
                     "warning: response was received but could not be saved locally: {error}"
                 ))?;
@@ -211,7 +221,7 @@ async fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
         match entry.kind() {
             SessionEntryKind::Prompt { text } => repl.show_you(text)?,
             SessionEntryKind::Response(response) => {
-                render_response(repl, response.clone(), false).await?
+                render_response(repl, response.clone(), false, Duration::ZERO).await?
             }
             SessionEntryKind::Error { message } => repl.show_error(message)?,
         }
@@ -222,11 +232,11 @@ async fn render_response(
     repl: &mut Repl,
     response: TranscriptResponse,
     streaming_enabled: bool,
+    stream_delay: Duration,
 ) -> Result<()> {
     for block in response.text_blocks {
         if streaming_enabled {
-            repl.show_adapt_streaming(&block.text, Duration::from_millis(35))
-                .await?;
+            repl.show_adapt_streaming(&block.text, stream_delay).await?;
         } else {
             repl.show_adapt(&block.text)?;
         }

@@ -35,6 +35,8 @@ AdaptTUI reads its bearer token from `~/.adapt/config.toml`:
 bearer_token = "paste-your-bearer-token-here"
 # Optional; defaults to Adapt's hosted MCP endpoint.
 endpoint = "https://app.adapt.com/mcp"
+# Optional; mock response delay between word chunks, in milliseconds.
+stream_delay_ms = 35
 ```
 
 Create the directory and protect the file before adding your token:
@@ -83,6 +85,8 @@ cargo run -- --allow-unverified-ask-adapt "your prompt"
 ```
 
 The interactive REPL prints a development-mode warning because `ask_adapt` is not verified as read-only and may perform mutations. The flag is not stored in configuration, and no other unverified capability can be enabled by it.
+
+Set `stream_delay_ms` in `~/.adapt/config.toml` to change the mock response pacing. It defaults to `35`; use `0` for immediate chunk rendering. The `/stream` command still controls whether chunked rendering is enabled for the current process.
 
 ## Documentation
 
