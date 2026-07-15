@@ -1,6 +1,5 @@
 //! Credential validation and error classification for Adapt authentication.
 
-use std::time::Duration;
 use thiserror::Error;
 
 use crate::config::AdaptConfig;
@@ -21,11 +20,11 @@ pub enum AuthError {
 /// invalid session. RMCP 0.16 then attempts to decode that body as JSON-RPC
 /// during initialization, hiding the actionable authentication failure. A
 /// lightweight authenticated GET lets us report the rejected credential first.
-pub async fn validate_credentials(config: &AdaptConfig) -> Result<(), AuthError> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| map_transport_error(error, &config.bearer_token))?
+pub async fn validate_credentials(
+    client: &reqwest::Client,
+    config: &AdaptConfig,
+) -> Result<(), AuthError> {
+    let response = client
         .get(&config.endpoint)
         .bearer_auth(&config.bearer_token)
         .send()
