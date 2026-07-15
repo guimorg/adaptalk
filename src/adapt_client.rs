@@ -7,7 +7,7 @@ use rmcp::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::future::Future;
+use std::{future::Future, time::Duration};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
@@ -31,6 +31,7 @@ pub struct QueryResponse {
 // capability. MCP annotations are hints supplied by the remote server, not a
 // sufficient authorization boundary on their own.
 const VERIFIED_READ_ONLY_CAPABILITIES: &[&str] = &[];
+const ADAPT_ORG_HEADER: &str = "x-adapt-org";
 
 #[derive(Debug, Error)]
 pub enum AdaptClientError {
@@ -75,8 +76,10 @@ impl ClientHandler for ClientHandlerImpl {}
 
 impl AdaptClient {
     pub async fn connect(config: &AdaptConfig) -> Result<Self, AdaptClientError> {
-        auth::validate_credentials(config).await?;
-        let transport = StreamableHttpClientTransport::from_config(transport_config(config));
+        let http_client = adapt_http_client(config)?;
+        auth::validate_credentials(&http_client, config).await?;
+        let transport =
+            StreamableHttpClientTransport::with_client(http_client, transport_config(config));
         let service = ClientHandlerImpl
             .serve(transport)
             .await
@@ -319,6 +322,22 @@ fn transport_config(config: &AdaptConfig) -> StreamableHttpClientTransportConfig
         .auth_header(config.bearer_token.clone())
 }
 
+fn adapt_http_client(config: &AdaptConfig) -> Result<reqwest::Client, auth::AuthError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .default_headers(adapt_headers(config)?)
+        .build()
+        .map_err(|error| auth::map_transport_error(error, &config.bearer_token))
+}
+
+fn adapt_headers(config: &AdaptConfig) -> Result<reqwest::header::HeaderMap, auth::AuthError> {
+    let org_id = reqwest::header::HeaderValue::from_str(&config.org_id)
+        .map_err(|error| auth::map_transport_error(error, &config.bearer_token))?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(ADAPT_ORG_HEADER, org_id);
+    Ok(headers)
+}
+
 fn ensure_ask_adapt_opt_in(allow_unverified: bool) -> Result<(), AdaptClientError> {
     if allow_unverified {
         Ok(())
@@ -344,6 +363,7 @@ mod tests {
     fn transport_config_passes_raw_token_to_rmcp() {
         let config = AdaptConfig {
             bearer_token: "session-token".into(),
+            org_id: "org-123".into(),
             endpoint: "https://app.adapt.com/mcp".into(),
             stream_delay: std::time::Duration::from_millis(35),
             source: "/tmp/config.toml".into(),
@@ -351,6 +371,22 @@ mod tests {
         assert_eq!(
             transport_config(&config).auth_header.as_deref(),
             Some("session-token")
+        );
+    }
+
+    #[test]
+    fn http_client_headers_include_the_adapt_org() {
+        let config = AdaptConfig {
+            bearer_token: "session-token".into(),
+            org_id: "org-123".into(),
+            endpoint: "https://app.adapt.com/mcp".into(),
+            stream_delay: std::time::Duration::from_millis(35),
+            source: "/tmp/config.toml".into(),
+        };
+
+        assert_eq!(
+            adapt_headers(&config).unwrap().get("X-Adapt-Org").unwrap(),
+            "org-123"
         );
     }
 

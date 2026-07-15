@@ -56,10 +56,11 @@ just check
 
 ## Configuration
 
-AdaptTUI reads its bearer token from `~/.adapt/config.toml`:
+AdaptTUI reads its bearer token and Adapt organization ID from `~/.adapt/config.toml`:
 
 ```toml
 bearer_token = "paste-your-bearer-token-here"
+org_id = "paste-your-adapt-org-id-here"
 # Optional; defaults to Adapt's hosted MCP endpoint.
 endpoint = "https://app.adapt.com/mcp"
 # Optional; mock response delay between word chunks, in milliseconds.
@@ -75,7 +76,7 @@ chmod 700 ~/.adapt
 chmod 600 ~/.adapt/config.toml
 ```
 
-To get a bearer token, sign in to Adapt and follow the token setup instructions in the [Adapt MCP Server documentation](https://adapt.com/docs/platform/mcp-server). Copy the token into `~/.adapt/config.toml`; do not commit the file or paste the token into source code, logs, or session history.
+To get a bearer token and organization ID, sign in to Adapt and follow the setup instructions in the [Adapt MCP Server documentation](https://adapt.com/docs/platform/mcp-server). Copy both values into `~/.adapt/config.toml`; do not commit the file or paste the token into source code, logs, or session history. AdaptTUI sends the organization ID as the `X-Adapt-Org` header on every Adapt request.
 
 AdaptTUI requires an `https://` endpoint because the bearer token is sent as authentication data. The `endpoint` setting is optional and is intended for an HTTPS Adapt endpoint such as a staging environment.
 

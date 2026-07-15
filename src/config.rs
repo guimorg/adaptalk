@@ -13,6 +13,7 @@ pub const DEFAULT_STREAM_DELAY_MS: u64 = 35;
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdaptConfig {
     pub bearer_token: String,
+    pub org_id: String,
     pub endpoint: String,
     pub stream_delay: Duration,
     pub source: PathBuf,
@@ -22,6 +23,7 @@ impl std::fmt::Debug for AdaptConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdaptConfig")
             .field("bearer_token", &"[redacted]")
+            .field("org_id", &self.org_id)
             .field("endpoint", &self.endpoint)
             .field("stream_delay_ms", &self.stream_delay.as_millis())
             .field("source", &self.source)
@@ -31,7 +33,7 @@ impl std::fmt::Debug for AdaptConfig {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("Adapt configuration is missing at {path}; create it with a bearer_token")]
+    #[error("Adapt configuration is missing at {path}; create it with a bearer_token and org_id")]
     Missing { path: PathBuf },
     #[error("Adapt configuration at {path} is malformed TOML: {source}")]
     Malformed {
@@ -41,6 +43,10 @@ pub enum ConfigError {
     },
     #[error("Adapt configuration at {path} does not contain a bearer_token")]
     MissingToken { path: PathBuf },
+    #[error("Adapt configuration at {path} does not contain an org_id")]
+    MissingOrgId { path: PathBuf },
+    #[error("Adapt configuration at {path} has an invalid org_id")]
+    InvalidOrgId { path: PathBuf },
     #[error("Adapt configuration at {path} has an invalid endpoint")]
     InvalidEndpoint { path: PathBuf },
     #[error(
@@ -54,6 +60,7 @@ pub enum ConfigError {
 #[derive(Debug, Deserialize)]
 struct FileConfig {
     bearer_token: Option<String>,
+    org_id: Option<String>,
     endpoint: Option<String>,
     stream_delay_ms: Option<i64>,
 }
@@ -88,6 +95,13 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<AdaptConfig, ConfigError> {
         .bearer_token
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| ConfigError::MissingToken { path: path.clone() })?;
+    let org_id = parsed
+        .org_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ConfigError::MissingOrgId { path: path.clone() })?;
+    if reqwest::header::HeaderValue::from_str(&org_id).is_err() {
+        return Err(ConfigError::InvalidOrgId { path });
+    }
     let endpoint = parsed
         .endpoint
         .unwrap_or_else(|| DEFAULT_ADAPT_ENDPOINT.to_owned());
@@ -102,6 +116,7 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<AdaptConfig, ConfigError> {
     }
     Ok(AdaptConfig {
         bearer_token: token,
+        org_id,
         endpoint,
         stream_delay: Duration::from_millis(stream_delay_ms as u64),
         source: path,
@@ -117,9 +132,10 @@ mod tests {
     #[test]
     fn defaults_endpoint() {
         let p = path("default");
-        fs::write(&p, "bearer_token = 'secret'").unwrap();
+        fs::write(&p, "bearer_token = 'secret'\norg_id = 'org-123'").unwrap();
         let c = load_from(&p).unwrap();
         assert_eq!(DEFAULT_ADAPT_ENDPOINT, "https://app.adapt.com/mcp");
+        assert_eq!(c.org_id, "org-123");
         assert_eq!(c.endpoint, DEFAULT_ADAPT_ENDPOINT);
         assert_eq!(
             c.stream_delay,
@@ -133,7 +149,7 @@ mod tests {
         let p = path("override");
         fs::write(
             &p,
-            "bearer_token='s'\nendpoint='https://staging.example/mcp'",
+            "bearer_token='s'\norg_id='org-123'\nendpoint='https://staging.example/mcp'",
         )
         .unwrap();
         assert_eq!(
@@ -146,7 +162,11 @@ mod tests {
     #[test]
     fn override_stream_delay() {
         let p = path("stream-delay");
-        fs::write(&p, "bearer_token='s'\nstream_delay_ms=120").unwrap();
+        fs::write(
+            &p,
+            "bearer_token='s'\norg_id='org-123'\nstream_delay_ms=120",
+        )
+        .unwrap();
         assert_eq!(
             load_from(&p).unwrap().stream_delay,
             Duration::from_millis(120)
@@ -164,7 +184,7 @@ mod tests {
     #[test]
     fn missing_token_is_distinct() {
         let p = path("token");
-        fs::write(&p, "endpoint='https://x'").unwrap();
+        fs::write(&p, "org_id='org-123'\nendpoint='https://x'").unwrap();
         assert!(matches!(
             load_from(&p),
             Err(ConfigError::MissingToken { .. })
@@ -173,9 +193,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_org_id_is_distinct() {
+        let p = path("org-id");
+        fs::write(&p, "bearer_token='s'").unwrap();
+        assert!(matches!(
+            load_from(&p),
+            Err(ConfigError::MissingOrgId { .. })
+        ));
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn rejects_org_id_that_cannot_be_sent_as_a_header() {
+        let p = path("invalid-org-id");
+        fs::write(&p, "bearer_token='s'\norg_id=\"org\\n123\"").unwrap();
+        assert!(matches!(
+            load_from(&p),
+            Err(ConfigError::InvalidOrgId { .. })
+        ));
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
     fn rejects_insecure_endpoint() {
         let p = path("insecure-endpoint");
-        fs::write(&p, "bearer_token='s'\nendpoint='http://localhost/mcp'").unwrap();
+        fs::write(
+            &p,
+            "bearer_token='s'\norg_id='org-123'\nendpoint='http://localhost/mcp'",
+        )
+        .unwrap();
         assert!(matches!(
             load_from(&p),
             Err(ConfigError::InvalidEndpoint { .. })
@@ -186,7 +232,7 @@ mod tests {
     #[test]
     fn rejects_negative_stream_delay() {
         let p = path("negative-stream-delay");
-        fs::write(&p, "bearer_token='s'\nstream_delay_ms=-1").unwrap();
+        fs::write(&p, "bearer_token='s'\norg_id='org-123'\nstream_delay_ms=-1").unwrap();
         assert!(matches!(
             load_from(&p),
             Err(ConfigError::InvalidStreamDelay { .. })
