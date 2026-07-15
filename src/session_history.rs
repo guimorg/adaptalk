@@ -68,8 +68,14 @@ impl SessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionEntry {
-    pub timestamp_ms: u128,
-    pub kind: SessionEntryKind,
+    timestamp_ms: u128,
+    kind: SessionEntryKind,
+}
+
+impl SessionEntry {
+    pub fn kind(&self) -> &SessionEntryKind {
+        &self.kind
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,13 +129,42 @@ pub enum SessionEntryKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
-    pub id: SessionId,
-    pub started_at_ms: u128,
-    pub updated_at_ms: u128,
-    pub status: SessionStatus,
+    id: SessionId,
+    started_at_ms: u128,
+    updated_at_ms: u128,
+    status: SessionStatus,
     #[serde(default)]
-    pub resumed_from_session_id: Option<SessionId>,
-    pub entries: Vec<SessionEntry>,
+    resumed_from_session_id: Option<SessionId>,
+    entries: Vec<SessionEntry>,
+}
+
+impl Session {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    pub fn status(&self) -> &SessionStatus {
+        &self.status
+    }
+
+    pub fn resumed_from_session_id(&self) -> Option<&SessionId> {
+        self.resumed_from_session_id.as_ref()
+    }
+
+    pub fn entries(&self) -> &[SessionEntry] {
+        &self.entries
+    }
+
+    /// `Some(None)` means this session has responded but did not provide a chat ID.
+    fn latest_response_remote_chat_id(&self) -> Option<Option<&str>> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                SessionEntryKind::Response(response) => Some(response.remote_chat_id.as_deref()),
+                _ => None,
+            })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -292,19 +327,6 @@ impl SessionHistory {
     }
     fn path_for(&self, id: &SessionId) -> PathBuf {
         self.directory.join(format!("{id}.json"))
-    }
-}
-
-impl Session {
-    /// `Some(None)` means this session has responded but did not provide a chat ID.
-    fn latest_response_remote_chat_id(&self) -> Option<Option<&str>> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match &entry.kind {
-                SessionEntryKind::Response(response) => Some(response.remote_chat_id.as_deref()),
-                _ => None,
-            })
     }
 }
 

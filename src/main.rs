@@ -30,7 +30,6 @@ struct Cli {
 
 struct TerminalQuery {
     client: AdaptClient,
-    redactor: Redactor,
     allow_unverified_ask_adapt: bool,
 }
 
@@ -44,9 +43,7 @@ impl ConversationQuery for TerminalQuery {
             } else {
                 self.client.query_read_only(prompt).await?
             };
-            Ok(self
-                .redactor
-                .transcript_response(transcript::from_query_response(response)?))
+            transcript::from_query_response(response)
         })
     }
 }
@@ -59,7 +56,6 @@ async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<Connection
     Ok(Connection {
         query: TerminalQuery {
             client,
-            redactor: redactor.clone(),
             allow_unverified_ask_adapt,
         },
         redactor,
@@ -166,17 +162,17 @@ fn show_history(repl: &mut Repl, history: &SessionHistory) -> Result<()> {
     }
     for session in sessions {
         let prompt = session
-            .entries
+            .entries()
             .iter()
-            .find_map(|entry| match &entry.kind {
+            .find_map(|entry| match entry.kind() {
                 SessionEntryKind::Prompt { text } => Some(text.as_str()),
                 _ => None,
             })
             .unwrap_or("(no prompts)");
         repl.show_notice(&format!(
             "{} · {} · {}",
-            session.id,
-            session.status.display_name(),
+            session.id(),
+            session.status().display_name(),
             compact(prompt)
         ))?;
     }
@@ -194,11 +190,11 @@ fn load_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<O
 fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
     repl.show_notice(&format!(
         "Session {} · {}",
-        session.id,
-        session.status.display_name()
+        session.id(),
+        session.status().display_name()
     ))?;
-    for entry in &session.entries {
-        match &entry.kind {
+    for entry in session.entries() {
+        match entry.kind() {
             SessionEntryKind::Prompt { text } => repl.show_you(text)?,
             SessionEntryKind::Response(response) => render_response(repl, response.clone())?,
             SessionEntryKind::Error { message } => repl.show_error(message)?,

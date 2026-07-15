@@ -6,10 +6,10 @@ use anyhow::Result;
 
 use crate::{
     redaction::Redactor,
-    session_history::{RedactedTranscriptResponse, Session, SessionHistory, TranscriptResponse},
+    session_history::{Session, SessionHistory, TranscriptResponse},
 };
 
-pub type QueryFuture<'a> = Pin<Box<dyn Future<Output = Result<RedactedTranscriptResponse>> + 'a>>;
+pub type QueryFuture<'a> = Pin<Box<dyn Future<Output = Result<TranscriptResponse>> + 'a>>;
 
 /// The narrow boundary needed to submit a prompt to an already-connected service.
 pub trait ConversationQuery {
@@ -88,7 +88,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
             return Ok(());
         }
         let resumed_from = match &self.state {
-            ConversationState::ViewingHistory(session) => Some(session.id.clone()),
+            ConversationState::ViewingHistory(session) => Some(session.id().clone()),
             ConversationState::Disconnected => None,
             ConversationState::Connected(_) => return Ok(()),
         };
@@ -127,6 +127,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         let continuation = self.history.latest_remote_chat_id(&active.session)?;
         match active.query.query(prompt, continuation.as_deref()).await {
             Ok(response) => {
+                let response = self.redactor.transcript_response(response);
                 let display = response.as_inner().clone();
                 match self.history.append_response(&mut active.session, response) {
                     Ok(()) => Ok(SubmitOutcome::Response(display)),
@@ -157,7 +158,7 @@ mod tests {
     #[derive(Clone)]
     struct Query {
         calls: Rc<RefCell<Vec<Option<String>>>>,
-        results: Rc<RefCell<Vec<Result<RedactedTranscriptResponse>>>>,
+        results: Rc<RefCell<Vec<Result<TranscriptResponse>>>>,
     }
 
     impl ConversationQuery for Query {
@@ -169,12 +170,12 @@ mod tests {
         }
     }
 
-    fn response(redactor: &Redactor, chat_id: Option<&str>) -> RedactedTranscriptResponse {
-        redactor.transcript_response(TranscriptResponse {
+    fn response(chat_id: Option<&str>) -> TranscriptResponse {
+        TranscriptResponse {
             text_blocks: vec![TextBlock { text: "ok".into() }],
             structured_result: None,
             remote_chat_id: chat_id.map(str::to_owned),
-        })
+        }
     }
 
     fn history(name: &str) -> (SessionHistory, std::path::PathBuf) {
@@ -190,7 +191,7 @@ mod tests {
     async fn opening_history_then_connecting_creates_a_local_continuation() {
         let (history, directory) = history("open");
         let mut origin = history.create().unwrap();
-        let origin_response = response(&Redactor::default(), Some("chat-1"));
+        let origin_response = Redactor::default().transcript_response(response(Some("chat-1")));
         history
             .append_response(&mut origin, origin_response)
             .unwrap();
@@ -200,10 +201,7 @@ mod tests {
         let calls = Rc::new(RefCell::new(vec![]));
         let query = Query {
             calls: calls.clone(),
-            results: Rc::new(RefCell::new(vec![
-                Ok(response(&redactor, None)),
-                Ok(response(&redactor, None)),
-            ])),
+            results: Rc::new(RefCell::new(vec![Ok(response(None)), Ok(response(None))])),
         };
         controller.connect(Connection { query, redactor }).unwrap();
         controller.submit("next").await.unwrap();
@@ -212,7 +210,7 @@ mod tests {
         assert!(
             sessions
                 .iter()
-                .any(|session| session.resumed_from_session_id.as_ref() == Some(&origin.id))
+                .any(|session| session.resumed_from_session_id() == Some(origin.id()))
         );
         assert_eq!(*calls.borrow(), vec![Some("chat-1".into()), None]);
         let _ = std::fs::remove_dir_all(directory);
@@ -239,8 +237,8 @@ mod tests {
                 .list()
                 .unwrap()
                 .iter()
-                .any(|session| session.entries.iter().any(|entry| matches!(
-                    entry.kind,
+                .any(|session| session.entries().iter().any(|entry| matches!(
+                    entry.kind(),
                     crate::session_history::SessionEntryKind::Error { .. }
                 )))
         );
@@ -252,10 +250,10 @@ mod tests {
         let (history, directory) = history("failed-connect");
         let opened = history.create().unwrap();
         let mut controller: ConversationController<Query> = ConversationController::new(history);
-        assert_eq!(controller.open(opened.clone()).unwrap().id, opened.id);
+        assert_eq!(controller.open(opened.clone()).unwrap().id(), opened.id());
         assert_eq!(
-            controller.viewing_session().map(|session| &session.id),
-            Some(&opened.id)
+            controller.viewing_session().map(Session::id),
+            Some(opened.id())
         );
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -263,7 +261,7 @@ mod tests {
     #[derive(Clone)]
     struct SaveFailingQuery {
         directory: std::path::PathBuf,
-        response: RedactedTranscriptResponse,
+        response: TranscriptResponse,
     }
 
     impl ConversationQuery for SaveFailingQuery {
@@ -285,13 +283,17 @@ mod tests {
     #[tokio::test]
     async fn remote_success_with_a_history_write_failure_is_not_an_error() {
         let (history, directory) = history("response-save-failure");
-        let redactor = Redactor::default();
         let query = SaveFailingQuery {
             directory: directory.clone(),
-            response: response(&redactor, Some("chat-1")),
+            response: response(Some("chat-1")),
         };
         let mut controller = ConversationController::new(history.clone());
-        controller.connect(Connection { query, redactor }).unwrap();
+        controller
+            .connect(Connection {
+                query,
+                redactor: Redactor::default(),
+            })
+            .unwrap();
         assert!(matches!(
             controller.submit("prompt").await.unwrap(),
             SubmitOutcome::ResponseWithPersistenceWarning { .. }
@@ -307,8 +309,8 @@ mod tests {
         let query = Query {
             calls: calls.clone(),
             results: Rc::new(RefCell::new(vec![
-                Ok(response(&redactor, Some("chat-1"))),
-                Ok(response(&redactor, Some("chat-2"))),
+                Ok(response(Some("chat-1"))),
+                Ok(response(Some("chat-2"))),
             ])),
         };
         let mut controller = ConversationController::new(history.clone());
@@ -316,6 +318,40 @@ mod tests {
         controller.submit("first").await.unwrap();
         controller.submit("second").await.unwrap();
         assert_eq!(*calls.borrow(), vec![None, Some("chat-1".into())]);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn controller_redacts_query_responses_before_display_and_persistence() {
+        let (history, directory) = history("response-redaction");
+        let secret = "top-secret";
+        let query = Query {
+            calls: Rc::new(RefCell::new(vec![])),
+            results: Rc::new(RefCell::new(vec![Ok(TranscriptResponse {
+                text_blocks: vec![TextBlock {
+                    text: format!("Bearer {secret}"),
+                }],
+                structured_result: Some(serde_json::json!({"token": secret})),
+                remote_chat_id: Some(secret.into()),
+            })])),
+        };
+        let mut controller = ConversationController::new(history.clone());
+        controller
+            .connect(Connection {
+                query,
+                redactor: Redactor::new(secret),
+            })
+            .unwrap();
+
+        let SubmitOutcome::Response(display) = controller.submit("prompt").await.unwrap() else {
+            panic!("response persistence should succeed");
+        };
+        assert!(!serde_json::to_string(&display).unwrap().contains(secret));
+        assert!(
+            !serde_json::to_string(&history.list().unwrap())
+                .unwrap()
+                .contains(secret)
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 }
