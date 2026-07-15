@@ -1,11 +1,13 @@
 # Autolabeler maps gitmoji PR-title prefixes to release categories.
 autolabeler:
   - label: 'feature'
-    title: ['/^✨|^:sparkles:|^♻️|^:recycle:|^👔|^:necktie:|^🧑‍💻|^:technologist:|^🛂|^:passport_control:|^🦺|^:safety_vest:/u']
+    title: ['/^✨|^:sparkles:|^🎉|^:tada:/u']
   - label: 'fix'
     title: ['/^🐛|^:bug:|^🚑|^:ambulance:|^🔒|^:lock:|^🥅|^:goal_net:|^🛡|^:shield:/u']
   - label: 'chore'
-    title: ['/^🔧|^:wrench:|^📦|^:package:|^⬆️|^:arrow_up:|^👷|^:construction_worker:|^🔥|^:fire:|^🧱|^:bricks:|^🔐|^:closed_lock_with_key:|^🛠|^:hammer_and_wrench:|^🎛|^:control_knobs:|^🐳|^:whale:/u']
+    title: ['/^🚚|^:truck:|^🔨|^:hammer:|^🔧|^:wrench:|^📦|^:package:|^⬆️|^:arrow_up:|^⬇️|^:arrow_down:|^👷|^:construction_worker:|^🔥|^:fire:|^🧱|^:bricks:|^🔐|^:closed_lock_with_key:|^🛠|^:hammer_and_wrench:/u']
+  - label: 'docs'
+    title: ['/^📝|^:memo:|^💡|^:bulb:/u']
   - label: 'major'
     title: ['/^💥|^:boom:/u']
 
