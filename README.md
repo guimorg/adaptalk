@@ -35,6 +35,8 @@ AdaptTUI reads its bearer token from `~/.adapt/config.toml`:
 bearer_token = "paste-your-bearer-token-here"
 # Optional; defaults to Adapt's hosted MCP endpoint.
 endpoint = "https://app.adapt.com/mcp"
+# Optional; mock response delay between word chunks, in milliseconds.
+stream_delay_ms = 35
 ```
 
 Create the directory and protect the file before adding your token:
@@ -70,8 +72,9 @@ Two REPL commands work entirely locally, before any configuration is read or MCP
 
 - `/history` lists saved sessions with their ID, status, and first-prompt summary.
 - `/open <id>` saves the active transcript, clears the terminal, and renders the selected transcript. The next prompt starts a new local snapshot linked to it. With `--allow-unverified-ask-adapt`, that prompt also sends the saved Adapt chat ID to continue the remote conversation; normal read-only mode never does.
+- `/stream` toggles mock response streaming for new replies. It is enabled by default and reveals completed responses in word-sized chunks; reopened transcripts render immediately.
 
-Type `/` at the prompt to see these commands in a compact suggestion palette. Fuzzy matches can be accepted with Tab or Enter before supplying `/open`'s session ID.
+Type `/` at the prompt to see these commands in a compact suggestion palette. Fuzzy matches can be accepted with Tab or Enter before supplying `/open`'s session ID. Mock streaming is a terminal presentation effect; real MCP progress-event streaming is not enabled yet.
 
 The connectivity milestone initializes against Adapt's hosted endpoint and discovers its capabilities. The client query seam accepts a prompt, invokes only a selected verified read-only capability, and preserves structured MCP results for the terminal layer.
 
@@ -82,6 +85,8 @@ cargo run -- --allow-unverified-ask-adapt "your prompt"
 ```
 
 The interactive REPL prints a development-mode warning because `ask_adapt` is not verified as read-only and may perform mutations. The flag is not stored in configuration, and no other unverified capability can be enabled by it.
+
+Set `stream_delay_ms` in `~/.adapt/config.toml` to change the mock response pacing. It defaults to `35`; use `0` for immediate chunk rendering. The `/stream` command still controls whether chunked rendering is enabled for the current process.
 
 ## Documentation
 

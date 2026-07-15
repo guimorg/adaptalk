@@ -11,6 +11,7 @@ use adapt_tui::{
 };
 use anyhow::Result;
 use clap::Parser;
+use std::time::Duration;
 
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
@@ -33,6 +34,33 @@ struct TerminalQuery {
     allow_unverified_ask_adapt: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsePresentation {
+    Immediate,
+    SimulatedStream { delay: Duration },
+}
+
+impl ResponsePresentation {
+    fn toggle(self, delay: Duration) -> Self {
+        match self {
+            Self::Immediate => Self::SimulatedStream { delay },
+            Self::SimulatedStream { .. } => Self::Immediate,
+        }
+    }
+
+    fn with_delay(self, delay: Duration) -> Self {
+        match self {
+            Self::Immediate => Self::Immediate,
+            Self::SimulatedStream { .. } => Self::SimulatedStream { delay },
+        }
+    }
+}
+
+struct TerminalConnection {
+    connection: Connection<TerminalQuery>,
+    stream_delay: Duration,
+}
+
 impl ConversationQuery for TerminalQuery {
     fn query<'a>(&'a self, prompt: &'a str, continuation: Option<&'a str>) -> QueryFuture<'a> {
         Box::pin(async move {
@@ -48,17 +76,21 @@ impl ConversationQuery for TerminalQuery {
     }
 }
 
-async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<Connection<TerminalQuery>> {
+async fn connect_terminal(allow_unverified_ask_adapt: bool) -> Result<TerminalConnection> {
     let config = config::load()?;
+    let stream_delay = config.stream_delay;
     let client = AdaptClient::connect(&config).await?;
     client.discover_capabilities().await?;
     let redactor = Redactor::new(&config.bearer_token);
-    Ok(Connection {
-        query: TerminalQuery {
-            client,
-            allow_unverified_ask_adapt,
+    Ok(TerminalConnection {
+        connection: Connection {
+            query: TerminalQuery {
+                client,
+                allow_unverified_ask_adapt,
+            },
+            redactor,
         },
-        redactor,
+        stream_delay,
     })
 }
 
@@ -72,7 +104,10 @@ async fn main() -> Result<()> {
 }
 
 async fn run_prompt(args: &Cli) -> Result<()> {
-    let Connection { query, redactor } = connect_terminal(args.allow_unverified_ask_adapt).await?;
+    let TerminalConnection {
+        connection: Connection { query, redactor },
+        ..
+    } = connect_terminal(args.allow_unverified_ask_adapt).await?;
     if args.allow_unverified_ask_adapt {
         eprintln!("{}", redactor.text(ASK_ADAPT_WARNING));
     }
@@ -94,6 +129,10 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut repl = Repl::start(allow_unverified_ask_adapt)?;
     let history = SessionHistory::for_credential_file(config::default_config_path()?);
     let mut controller = ConversationController::<TerminalQuery>::new(history);
+    let mut presentation = ResponsePresentation::SimulatedStream {
+        delay: Duration::from_millis(config::DEFAULT_STREAM_DELAY_MS),
+    };
+    let mut stream_delay = Duration::from_millis(config::DEFAULT_STREAM_DELAY_MS);
     loop {
         let Some(prompt) = repl.read_prompt()? else {
             return controller.finish();
@@ -108,7 +147,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                     if let Some(session) = load_history(&mut repl, controller.history(), &id)? {
                         let opened = controller.open(session)?;
                         repl.clear_transcript()?;
-                        render_history(&mut repl, &opened)?;
+                        render_history(&mut repl, &opened).await?;
                         if controller.viewing_continuation()?.is_none() {
                             repl.show_notice("This session has no remote chat ID; the next prompt starts a new remote conversation.")?;
                         } else if !allow_unverified_ask_adapt {
@@ -116,29 +155,43 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                         }
                     }
                 }
+                ReplCommand::ToggleStreaming => {
+                    presentation = presentation.toggle(stream_delay);
+                    repl.show_notice(
+                        if matches!(presentation, ResponsePresentation::SimulatedStream { .. }) {
+                            "Mock response streaming enabled."
+                        } else {
+                            "Mock response streaming disabled."
+                        },
+                    )?;
+                }
                 ReplCommand::Unknown(message) => repl.show_error(&message)?,
             }
             continue;
         }
         repl.show_working()?;
         if controller.needs_connection() {
-            let connection = match connect_terminal(allow_unverified_ask_adapt).await {
+            let terminal_connection = match connect_terminal(allow_unverified_ask_adapt).await {
                 Ok(connection) => connection,
                 Err(error) => {
                     repl.show_error(&controller.redact(&error.to_string()))?;
                     continue;
                 }
             };
-            if let Err(error) = controller.connect(connection) {
+            stream_delay = terminal_connection.stream_delay;
+            presentation = presentation.with_delay(stream_delay);
+            if let Err(error) = controller.connect(terminal_connection.connection) {
                 repl.show_error(&controller.redact(&error.to_string()))?;
                 continue;
             }
         }
         let result = controller.submit(&prompt).await;
         match result {
-            Ok(SubmitOutcome::Response(response)) => render_response(&mut repl, response)?,
+            Ok(SubmitOutcome::Response(response)) => {
+                render_response(&mut repl, response, presentation).await?
+            }
             Ok(SubmitOutcome::ResponseWithPersistenceWarning { response, error }) => {
-                render_response(&mut repl, response)?;
+                render_response(&mut repl, response, presentation).await?;
                 repl.show_notice(&format!(
                     "warning: response was received but could not be saved locally: {error}"
                 ))?;
@@ -189,7 +242,7 @@ fn load_history(repl: &mut Repl, history: &SessionHistory, id: &str) -> Result<O
         }
     }
 }
-fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
+async fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
     repl.show_notice(&format!(
         "Session {} · {}",
         session.id(),
@@ -198,15 +251,26 @@ fn render_history(repl: &mut Repl, session: &Session) -> Result<()> {
     for entry in session.entries() {
         match entry.kind() {
             SessionEntryKind::Prompt { text } => repl.show_you(text)?,
-            SessionEntryKind::Response(response) => render_response(repl, response.clone())?,
+            SessionEntryKind::Response(response) => {
+                render_response(repl, response.clone(), ResponsePresentation::Immediate).await?
+            }
             SessionEntryKind::Error { message } => repl.show_error(message)?,
         }
     }
     Ok(())
 }
-fn render_response(repl: &mut Repl, response: TranscriptResponse) -> Result<()> {
+async fn render_response(
+    repl: &mut Repl,
+    response: TranscriptResponse,
+    presentation: ResponsePresentation,
+) -> Result<()> {
     for block in response.text_blocks {
-        repl.show_adapt(&block.text)?;
+        match presentation {
+            ResponsePresentation::Immediate => repl.show_adapt(&block.text)?,
+            ResponsePresentation::SimulatedStream { delay } => {
+                repl.show_adapt_streaming(&block.text, delay).await?
+            }
+        }
     }
     if let Some(value) = response.structured_result {
         repl.show_structured_result(value)?;
@@ -220,7 +284,9 @@ fn compact(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use std::time::Duration;
+
+    use super::{Cli, ResponsePresentation};
     use adapt_tui::{adapt_client::QueryResponse, redaction::Redactor, transcript};
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use rmcp::model::{Content, RawContent};
@@ -292,5 +358,44 @@ mod tests {
             .into_inner();
         let stored = transcript.display_value().to_string();
         assert!(!stored.contains("top-secret"));
+    }
+
+    #[test]
+    fn stream_toggle_switches_between_immediate_and_simulated_output() {
+        let delay = Duration::from_millis(120);
+        let simulated = ResponsePresentation::SimulatedStream { delay };
+        assert_eq!(simulated.toggle(delay), ResponsePresentation::Immediate);
+        assert_eq!(ResponsePresentation::Immediate.toggle(delay), simulated);
+    }
+
+    #[test]
+    fn configured_delay_updates_only_simulated_output() {
+        let configured = Duration::from_millis(80);
+        assert_eq!(
+            ResponsePresentation::SimulatedStream {
+                delay: Duration::from_millis(35),
+            }
+            .with_delay(configured),
+            ResponsePresentation::SimulatedStream { delay: configured }
+        );
+        assert_eq!(
+            ResponsePresentation::Immediate.with_delay(configured),
+            ResponsePresentation::Immediate
+        );
+    }
+
+    #[test]
+    fn configured_delay_survives_disabling_and_reenabling_streaming() {
+        let configured = Duration::from_millis(120);
+        let mut presentation = ResponsePresentation::SimulatedStream { delay: configured };
+
+        presentation = presentation.toggle(configured);
+        assert_eq!(presentation, ResponsePresentation::Immediate);
+
+        presentation = presentation.toggle(configured);
+        assert_eq!(
+            presentation,
+            ResponsePresentation::SimulatedStream { delay: configured }
+        );
     }
 }

@@ -66,7 +66,7 @@ The first implementation milestone is a connectivity slice: authenticate, initia
 - Reopening a local transcript is always supported. Remote continuation is conditional on a stable Adapt session identifier; without one, AdaptTUI starts a new remote Adapt Session and only uses prior context when explicitly requested.
 - The MCP client uses the official Rust RMCP SDK and keeps transport/protocol details behind an Adapt-specific client adapter.
 - The REPL uses Crossterm for terminal styling and cursor control. Tokio provides the asynchronous runtime needed for MCP work.
-- The REPL shows a working indicator and then renders complete responses. Progressive MCP response streaming remains a future client enhancement.
+- The REPL shows `Adapt: is typing…` while a request is pending. Completed responses are mock-streamed into the terminal by default in word-sized chunks; `/stream` toggles this presentation behavior for the current process, and `stream_delay_ms` configures the pacing. Real MCP progress-event streaming remains a future client enhancement.
 - The repository uses a minimal Nix flake with a pinned stable Rust toolchain, Cargo, rustfmt, Clippy, Rust Analyzer, and basic developer commands. The sibling project's container and Kubernetes tooling is not carried over.
 - The highest test seam is the Adapt client boundary: a fake MCP server/transport should drive authentication, initialization, capability discovery, read-only filtering, tool invocation, response events, errors, and remote-session identifiers. The REPL should be tested at the user-visible behavior seam.
 

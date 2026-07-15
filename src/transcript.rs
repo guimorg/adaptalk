@@ -28,6 +28,35 @@ impl TranscriptResponse {
     }
 }
 
+/// Split a message into chunks suitable for streaming display, preserving word boundaries and whitespace.
+pub fn streaming_chunks(message: &str) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut leading_whitespace = String::new();
+
+    for segment in message.split_inclusive(char::is_whitespace) {
+        if segment.chars().all(char::is_whitespace) {
+            if let Some(last) = chunks.last_mut() {
+                last.push_str(segment);
+            } else {
+                leading_whitespace.push_str(segment);
+            }
+        } else {
+            chunks.push(format!("{leading_whitespace}{segment}"));
+            leading_whitespace.clear();
+        }
+    }
+
+    if !leading_whitespace.is_empty() {
+        if let Some(last) = chunks.last_mut() {
+            last.push_str(&leading_whitespace);
+        } else {
+            chunks.push(leading_whitespace);
+        }
+    }
+
+    chunks
+}
+
 /// Preserve text for the terminal and, when present, one opaque structured result.
 /// Protocol-specific fields such as citations deliberately do not escape this boundary.
 pub fn from_query_response(response: QueryResponse) -> TranscriptResponse {
@@ -85,5 +114,19 @@ mod tests {
             transcript.text_blocks[0].text,
             "[unsupported Adapt content]"
         );
+    }
+
+    #[test]
+    fn chunks_preserve_word_boundaries_and_whitespace() {
+        assert_eq!(
+            super::streaming_chunks("Hello,  world\nfrom Adapt"),
+            vec!["Hello,  ", "world\n", "from ", "Adapt"]
+        );
+    }
+
+    #[test]
+    fn chunks_handle_empty_and_whitespace_only_messages() {
+        assert!(super::streaming_chunks("").is_empty());
+        assert_eq!(super::streaming_chunks("  \n"), vec!["  \n"]);
     }
 }

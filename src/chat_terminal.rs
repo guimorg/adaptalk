@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 use crossterm::{
     cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
@@ -9,8 +10,10 @@ use crossterm::{
 };
 use serde_json::Value;
 
-pub struct Repl {
-    stdout: io::Stdout,
+use crate::transcript::streaming_chunks;
+
+pub struct Repl<W: Write = io::Stdout> {
+    stdout: W,
     waiting: bool,
     unverified_development_mode: bool,
 }
@@ -19,12 +22,14 @@ pub struct Repl {
 pub enum ReplCommand {
     History,
     Open(String),
+    ToggleStreaming,
     Unknown(String),
 }
 
-const COMMAND_PALETTE: [(&str, &str); 2] = [
+const COMMAND_PALETTE: [(&str, &str); 3] = [
     ("/history", "Browse saved local sessions"),
     ("/open <id>", "Reopen a saved transcript"),
+    ("/stream", "Toggle mock response streaming"),
 ];
 
 pub fn parse_command(input: &str) -> Option<ReplCommand> {
@@ -40,8 +45,9 @@ pub fn parse_command(input: &str) -> Option<ReplCommand> {
             Some(ReplCommand::Unknown("/open requires a session ID".into()))
         }
         Some(("/history", _)) | None if input == "/history" => Some(ReplCommand::History),
+        Some(("/stream", _)) | None if input == "/stream" => Some(ReplCommand::ToggleStreaming),
         _ => Some(ReplCommand::Unknown(format!(
-            "unknown command `{input}`; use /history or /open <id>"
+            "unknown command `{input}`; use /history, /open <id>, or /stream"
         ))),
     }
 }
@@ -83,7 +89,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-impl Repl {
+impl Repl<io::Stdout> {
     pub fn start(unverified_development_mode: bool) -> io::Result<Self> {
         let mut repl = Self {
             stdout: io::stdout(),
@@ -92,6 +98,22 @@ impl Repl {
         };
         repl.clear_transcript()?;
         Ok(repl)
+    }
+}
+
+impl<W: Write> Repl<W> {
+    pub fn with_output(stdout: W, unverified_development_mode: bool) -> io::Result<Self> {
+        let mut repl = Self {
+            stdout,
+            waiting: false,
+            unverified_development_mode,
+        };
+        repl.clear_transcript()?;
+        Ok(repl)
+    }
+
+    pub fn into_output(self) -> W {
+        self.stdout
     }
 
     pub fn clear_transcript(&mut self) -> io::Result<()> {
@@ -162,7 +184,7 @@ impl Repl {
 
     pub fn show_working(&mut self) -> io::Result<()> {
         self.write_label("Adapt", Color::Yellow)?;
-        self.write_plain(": is working…\r\n")?;
+        self.write_plain(": is typing…\r\n")?;
         self.waiting = true;
         Ok(())
     }
@@ -178,6 +200,21 @@ impl Repl {
     pub fn show_adapt(&mut self, message: &str) -> io::Result<()> {
         self.clear_working()?;
         self.write_message("Adapt", Color::Magenta, message)
+    }
+
+    pub async fn show_adapt_streaming(&mut self, message: &str, delay: Duration) -> io::Result<()> {
+        self.clear_working()?;
+        let mut writer = LineAwareMessageWriter::start(&mut self.stdout, "Adapt", Color::Magenta)?;
+
+        let chunks = streaming_chunks(message);
+        for (index, chunk) in chunks.iter().enumerate() {
+            writer.write_text(chunk)?;
+            writer.flush()?;
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        writer.finish()
     }
 
     pub fn show_structured_result(&mut self, value: Value) -> io::Result<()> {
@@ -260,22 +297,9 @@ impl Repl {
     }
 
     fn write_message(&mut self, label: &str, color: Color, message: &str) -> io::Result<()> {
-        let mut lines = message.lines();
-        if let Some(first_line) = lines.next() {
-            self.write_label(label, color)?;
-            self.write_plain(": ")?;
-            self.write_plain(first_line)?;
-            self.write_plain("\r\n")?;
-        } else {
-            self.write_label(label, color)?;
-            self.write_plain(":\r\n")?;
-        }
-        for line in lines {
-            self.write_plain("  ")?;
-            self.write_plain(line)?;
-            self.write_plain("\r\n")?;
-        }
-        self.stdout.flush()
+        let mut writer = LineAwareMessageWriter::start(&mut self.stdout, label, color)?;
+        writer.write_text(message)?;
+        writer.finish()
     }
 
     fn write_label(&mut self, label: &str, color: Color) -> io::Result<()> {
@@ -299,6 +323,105 @@ impl Repl {
     fn write_plain(&mut self, text: &str) -> io::Result<()> {
         write!(self.stdout, "{text}")?;
         self.stdout.flush()
+    }
+}
+
+struct LineAwareMessageWriter<'a, W: Write> {
+    output: &'a mut W,
+    first_line: bool,
+    at_line_start: bool,
+    ended_with_newline: bool,
+    pending_carriage_return: bool,
+    saw_input: bool,
+}
+
+impl<'a, W: Write> LineAwareMessageWriter<'a, W> {
+    fn start(output: &'a mut W, label: &str, color: Color) -> io::Result<Self> {
+        execute!(
+            output,
+            SetForegroundColor(color),
+            SetAttribute(Attribute::Bold)
+        )?;
+        write!(output, "{label}")?;
+        execute!(output, SetAttribute(Attribute::Reset))?;
+        Ok(Self {
+            output,
+            first_line: true,
+            at_line_start: true,
+            ended_with_newline: false,
+            pending_carriage_return: false,
+            saw_input: false,
+        })
+    }
+
+    fn write_text(&mut self, text: &str) -> io::Result<()> {
+        for character in text.chars() {
+            if self.pending_carriage_return {
+                if character == '\n' {
+                    self.write_newline()?;
+                    self.pending_carriage_return = false;
+                    continue;
+                }
+                self.write_content('\r')?;
+                self.pending_carriage_return = false;
+            }
+            if character == '\r' {
+                self.pending_carriage_return = true;
+            } else if character == '\n' {
+                self.write_newline()?;
+            } else {
+                self.write_content(character)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if self.pending_carriage_return {
+            self.write_content('\r')?;
+        }
+        if !self.ended_with_newline {
+            if !self.saw_input {
+                write!(self.output, ":")?;
+            }
+            write!(self.output, "\r\n")?;
+        }
+        self.output.flush()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+
+    fn write_content(&mut self, character: char) -> io::Result<()> {
+        if self.at_line_start {
+            if self.first_line {
+                write!(self.output, ": ")?;
+            } else {
+                write!(self.output, "  ")?;
+            }
+        }
+        write!(self.output, "{character}")?;
+        self.at_line_start = false;
+        self.ended_with_newline = false;
+        self.saw_input = true;
+        Ok(())
+    }
+
+    fn write_newline(&mut self) -> io::Result<()> {
+        if self.at_line_start {
+            if self.first_line {
+                write!(self.output, ": ")?;
+            } else {
+                write!(self.output, "  ")?;
+            }
+        }
+        write!(self.output, "\r\n")?;
+        self.first_line = false;
+        self.at_line_start = true;
+        self.ended_with_newline = true;
+        self.saw_input = true;
+        Ok(())
     }
 }
 
@@ -332,6 +455,8 @@ fn completed_command(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         ReplCommand, completed_command, matching_commands, parse_command, shows_command_palette,
     };
@@ -339,6 +464,7 @@ mod tests {
     #[test]
     fn recognizes_history_and_open_commands() {
         assert_eq!(parse_command("/history"), Some(ReplCommand::History));
+        assert_eq!(parse_command("/stream"), Some(ReplCommand::ToggleStreaming));
         assert_eq!(
             parse_command("/open abc"),
             Some(ReplCommand::Open("abc".into()))
@@ -355,6 +481,7 @@ mod tests {
         assert!(shows_command_palette("/his"));
         assert!(shows_command_palette("/ope"));
         assert!(shows_command_palette("/history"));
+        assert!(shows_command_palette("/stream"));
         assert!(!shows_command_palette("/unknown"));
         assert!(!shows_command_palette(""));
         assert!(!shows_command_palette("ask Adapt"));
@@ -383,5 +510,67 @@ mod tests {
         assert_eq!(completed_command("/his"), Some("/history".into()));
         assert_eq!(completed_command("/pn"), Some("/open ".into()));
         assert_eq!(completed_command("/history"), None);
+    }
+
+    #[test]
+    fn renders_typing_indicator_at_the_user_visible_seam() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_working().unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("Adapt: is typing…\r\n"));
+    }
+
+    #[test]
+    fn immediate_multiline_output_indents_continuation_lines() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_adapt("first\nsecond").unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("Adapt: first\r\n  second\r\n"));
+    }
+
+    #[test]
+    fn immediate_output_preserves_canonical_line_semantics() {
+        for (message, expected) in [
+            ("", "Adapt:\r\n"),
+            ("first\nsecond", "Adapt: first\r\n  second\r\n"),
+            ("first\r\nsecond", "Adapt: first\r\n  second\r\n"),
+            ("trailing\n", "Adapt: trailing\r\n"),
+        ] {
+            let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+            repl.show_adapt(message).unwrap();
+            let output = visible(&repl.into_output());
+            assert!(
+                output.ends_with(expected),
+                "message {message:?}: {output:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_multiline_output_uses_the_same_line_formatting() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_adapt_streaming("first\nsecond", Duration::ZERO)
+            .await
+            .unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("Adapt: first\r\n  second\r\n"));
+    }
+
+    fn visible(output: &[u8]) -> String {
+        let text = String::from_utf8_lossy(output);
+        let mut visible = String::new();
+        let mut in_escape = false;
+        for character in text.chars() {
+            if in_escape {
+                if character.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if character == '\x1b' {
+                in_escape = true;
+            } else {
+                visible.push(character);
+            }
+        }
+        visible
     }
 }
