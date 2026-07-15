@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A read-only terminal client for Adapt's MCP server"
 license = "MIT"
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"
@@ -28,3 +29,10 @@ rmcp = { version = "0.16", features = [
 
 [lints.rust]
 unsafe_code = "forbid"
+warnings = "deny"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
