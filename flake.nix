@@ -12,6 +12,15 @@
   in {
     formatter = forAllSystems (pkgs: pkgs.alejandra);
 
+    packages = forAllSystems (pkgs: {
+      default = pkgs.rustPlatform.buildRustPackage {
+        pname = "adapt-tui";
+        version = "0.1.0";
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+      };
+    });
+
     devShells = forAllSystems (pkgs: {
       default = pkgs.mkShell {
         packages = with pkgs; [

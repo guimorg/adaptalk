@@ -4,6 +4,8 @@ A small Rust terminal REPL for using Adapt through its hosted MCP server.
 
 > AdaptTUI is read-only by default: it exposes only MCP capabilities explicitly marked `readOnlyHint: true`. Mutating and ambiguously classified capabilities are rejected.
 
+**Requirements:** Rust 1.85 or later (edition 2024).
+
 The project is intentionally starting as a thin Adapt client:
 
 - chat-first terminal interaction;
@@ -12,18 +14,43 @@ The project is intentionally starting as a thin Adapt client:
 - local session history under `.adapt/sessions/`;
 - bearer-token configuration under `.adapt/`, separate from history.
 
+## Installation
+
+Download the latest release binary from the [Releases page](https://github.com/guimorg/adaptui/releases), then:
+
+```sh
+chmod +x adapt-tui
+mv adapt-tui /usr/local/bin/
+adapt-tui
+```
+
+Or build from source:
+
+```sh
+cargo install --git https://github.com/guimorg/adaptui
+adapt-tui
+```
+
 ## Development
 
-Enter the pinned development environment with:
+With Nix:
 
 ```sh
 nix develop
+cargo run
 ```
 
-Then run:
+Without Nix, you need Rust 1.85+, rustfmt, clippy, and `just`.
+
+Run tests:
 
 ```sh
-cargo run
+cargo test
+```
+
+Check everything (format, lint, tests):
+
+```sh
 just check
 ```
 
@@ -87,6 +114,32 @@ cargo run -- --allow-unverified-ask-adapt "your prompt"
 The interactive REPL prints a development-mode warning because `ask_adapt` is not verified as read-only and may perform mutations. The flag is not stored in configuration, and no other unverified capability can be enabled by it.
 
 Set `stream_delay_ms` in `~/.adapt/config.toml` to change the mock response pacing. It defaults to `35`; use `0` for immediate chunk rendering. The `/stream` command still controls whether chunked rendering is enabled for the current process.
+
+## Troubleshooting
+
+**"Authentication rejected" error**
+
+Your bearer token is invalid or expired. Refresh it in `~/.adapt/config.toml` from your Adapt account. Check that the file is readable and that the token has no extra whitespace.
+
+**"No read-only capability available"**
+
+No verified read-only capabilities are currently exposed. This is intentional until Adapt documents and verifies a non-mutating operation. You can test with `--allow-unverified-ask-adapt` in development mode, but the interactive REPL will show this error in normal mode.
+
+**Session history write fails with "Permission denied"**
+
+Check that `~/.adapt/` exists and is writable:
+
+```sh
+ls -la ~/.adapt/
+chmod 700 ~/.adapt
+chmod 600 ~/.adapt/config.toml
+```
+
+The client creates `~/.adapt/sessions/` with restrictive permissions (0o700 directory, 0o600 files).
+
+**"Cannot connect to MCP server" or timeout**
+
+Check your network connection and that the endpoint is reachable. If using a custom endpoint, verify it's HTTPS and accepts the bearer token.
 
 ## Documentation
 

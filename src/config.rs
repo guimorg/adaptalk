@@ -33,8 +33,12 @@ impl std::fmt::Debug for AdaptConfig {
 pub enum ConfigError {
     #[error("Adapt configuration is missing at {path}; create it with a bearer_token")]
     Missing { path: PathBuf },
-    #[error("Adapt configuration at {path} is malformed TOML")]
-    Malformed { path: PathBuf },
+    #[error("Adapt configuration at {path} is malformed TOML: {source}")]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("Adapt configuration at {path} does not contain a bearer_token")]
     MissingToken { path: PathBuf },
     #[error("Adapt configuration at {path} has an invalid endpoint")]
@@ -76,8 +80,10 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<AdaptConfig, ConfigError> {
             ConfigError::Read { path: path.clone() }
         }
     })?;
-    let parsed: FileConfig =
-        toml::from_str(&text).map_err(|_| ConfigError::Malformed { path: path.clone() })?;
+    let parsed: FileConfig = toml::from_str(&text).map_err(|source| ConfigError::Malformed {
+        path: path.clone(),
+        source,
+    })?;
     let token = parsed
         .bearer_token
         .filter(|v| !v.trim().is_empty())

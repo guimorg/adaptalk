@@ -113,7 +113,10 @@ async fn run_prompt(args: &Cli) -> Result<()> {
         eprintln!("{}", redactor.text(ASK_ADAPT_WARNING));
     }
     let prompt = args.prompt.join(" ");
-    let response = query.query(&prompt, None).await?;
+    let response = query
+        .query(&prompt, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", redactor.text(&e.to_string())))?;
     println!(
         "response: {}",
         serde_json::to_string_pretty(

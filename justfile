@@ -9,6 +9,12 @@ check:
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-targets
 
+build:
+    cargo build
+
+release:
+    cargo build --release
+
 run:
     cargo run
 

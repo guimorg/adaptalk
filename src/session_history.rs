@@ -10,6 +10,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use thiserror::Error;
 
 use crate::transcript::TranscriptResponse;
@@ -157,12 +160,24 @@ impl Session {
 
 #[derive(Debug, Error)]
 pub enum HistoryError {
-    #[error("could not create local session history at {path}")]
-    CreateDirectory { path: PathBuf },
-    #[error("could not write local session history at {path}")]
-    Write { path: PathBuf },
-    #[error("could not read local session history at {path}")]
-    Read { path: PathBuf },
+    #[error("could not create local session history at {path}: {source}")]
+    CreateDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not write local session history at {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not read local session history at {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("local session `{id}` was not found")]
     NotFound { id: String },
     #[error("local session ID `{id}` is invalid")]
@@ -245,12 +260,14 @@ impl SessionHistory {
             return Ok(vec![]);
         }
         let mut sessions = fs::read_dir(&self.directory)
-            .map_err(|_| HistoryError::Read {
+            .map_err(|source| HistoryError::Read {
                 path: self.directory.clone(),
+                source,
             })?
             .map(|entry| {
-                entry.map_err(|_| HistoryError::Read {
+                entry.map_err(|source| HistoryError::Read {
                     path: self.directory.clone(),
+                    source,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -273,7 +290,7 @@ impl SessionHistory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Err(HistoryError::NotFound { id: id.to_string() })
             }
-            Err(_) => Err(HistoryError::Read { path }),
+            Err(source) => Err(HistoryError::Read { path, source }),
         }
     }
     /// Resolve continuation from this session's responses, then its immutable lineage.
@@ -319,17 +336,48 @@ impl SessionHistory {
         Ok(())
     }
     fn save(&self, session: &mut Session) -> Result<(), HistoryError> {
-        fs::create_dir_all(&self.directory).map_err(|_| HistoryError::CreateDirectory {
+        fs::create_dir_all(&self.directory).map_err(|source| HistoryError::CreateDirectory {
             path: self.directory.clone(),
+            source,
         })?;
+        #[cfg(unix)]
+        {
+            let perms = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&self.directory, perms).map_err(|source| {
+                HistoryError::CreateDirectory {
+                    path: self.directory.clone(),
+                    source,
+                }
+            })?;
+        }
         session.updated_at_ms = timestamp_ms();
         let path = self.path_for(&session.id);
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let serialized = serde_json::to_vec_pretty(&StoredSession::from(&*session))
-            .map_err(|_| HistoryError::Write { path: path.clone() })?;
-        fs::write(&temporary, serialized)
-            .map_err(|_| HistoryError::Write { path: path.clone() })?;
-        fs::rename(&temporary, &path).map_err(|_| HistoryError::Write { path })
+        let serialized =
+            serde_json::to_vec_pretty(&StoredSession::from(&*session)).map_err(|_| {
+                HistoryError::Write {
+                    path: path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "JSON serialization failed",
+                    ),
+                }
+            })?;
+        fs::write(&temporary, serialized).map_err(|source| HistoryError::Write {
+            path: path.clone(),
+            source,
+        })?;
+        fs::rename(&temporary, &path).map_err(|source| HistoryError::Write {
+            path: path.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            let perms = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&path, perms)
+                .map_err(|source| HistoryError::Write { path, source })?;
+        }
+        Ok(())
     }
     fn path_for(&self, id: &SessionId) -> PathBuf {
         self.directory.join(format!("{id}.json"))
@@ -337,8 +385,9 @@ impl SessionHistory {
 }
 
 fn load_file(path: &Path) -> Result<Session, HistoryError> {
-    let text = fs::read_to_string(path).map_err(|_| HistoryError::Read {
+    let text = fs::read_to_string(path).map_err(|source| HistoryError::Read {
         path: path.to_path_buf(),
+        source,
     })?;
     let stored: StoredSession =
         serde_json::from_str(&text).map_err(|_| HistoryError::Malformed {
