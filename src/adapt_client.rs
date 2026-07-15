@@ -7,10 +7,11 @@ use rmcp::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{future::Future, time::Duration};
+use std::future::Future;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
+use crate::auth::{self, sanitize_transport_error};
 use crate::config::AdaptConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -33,10 +34,8 @@ const VERIFIED_READ_ONLY_CAPABILITIES: &[&str] = &[];
 
 #[derive(Debug, Error)]
 pub enum AdaptClientError {
-    #[error(
-        "Adapt authentication was rejected by the server; refresh bearer_token in ~/.adapt/config.toml and retry"
-    )]
-    AuthenticationRejected,
+    #[error(transparent)]
+    Auth(#[from] auth::AuthError),
     #[error("Adapt capability `{0}` is not verified as read-only")]
     CapabilityNotReadOnly(String),
     #[error("Adapt capability `ask_adapt` requires --allow-unverified-ask-adapt")]
@@ -45,8 +44,6 @@ pub enum AdaptClientError {
     CapabilityFailed { capability: String, detail: String },
     #[error("Adapt has no verified read-only capability available")]
     NoReadOnlyCapability,
-    #[error("Adapt endpoint or transport failed: {0}")]
-    Transport(String),
 }
 
 pub struct AdaptClient {
@@ -78,12 +75,12 @@ impl ClientHandler for ClientHandlerImpl {}
 
 impl AdaptClient {
     pub async fn connect(config: &AdaptConfig) -> Result<Self, AdaptClientError> {
-        validate_credentials(config).await?;
+        auth::validate_credentials(config).await?;
         let transport = StreamableHttpClientTransport::from_config(transport_config(config));
         let service = ClientHandlerImpl
             .serve(transport)
             .await
-            .map_err(|e| map_transport_error(e, &config.bearer_token))?;
+            .map_err(|e| auth::map_transport_error(e, &config.bearer_token))?;
         Ok(Self {
             service,
             credential: config.bearer_token.clone(),
@@ -126,18 +123,8 @@ impl AdaptClient {
         capability: &str,
         prompt: &str,
     ) -> Result<QueryResponse, AdaptClientError> {
-        let tools = self.cached_tools().await?;
-        let Some(tool) = tools.iter().find(|tool| tool.name == capability) else {
-            return Err(AdaptClientError::CapabilityNotReadOnly(
-                capability.to_owned(),
-            ));
-        };
-        if !is_verified_read_only(tool) {
-            return Err(AdaptClientError::CapabilityNotReadOnly(
-                capability.to_owned(),
-            ));
-        }
-
+        self.lookup_capability(capability, is_verified_read_only)
+            .await?;
         self.invoke_tool(capability, prompt).await
     }
 
@@ -195,13 +182,23 @@ impl AdaptClient {
     async fn cached_tools(&self) -> Result<&[rmcp::model::Tool], AdaptClientError> {
         self.capabilities
             .get_or_try_init(|| async {
-                self.service
-                    .peer()
-                    .list_all_tools()
-                    .await
-                    .map_err(|e| map_transport_error(e, &self.credential))
+                self.service.peer().list_all_tools().await.map_err(|e| {
+                    AdaptClientError::Auth(auth::map_transport_error(e, &self.credential))
+                })
             })
             .await
+    }
+
+    async fn lookup_capability<F>(&self, name: &str, validator: F) -> Result<(), AdaptClientError>
+    where
+        F: Fn(&rmcp::model::Tool) -> bool,
+    {
+        let tools = self.cached_tools().await?;
+        tools
+            .iter()
+            .find(|tool| tool.name == name && validator(tool))
+            .ok_or_else(|| AdaptClientError::CapabilityNotReadOnly(name.to_owned()))?;
+        Ok(())
     }
 
     async fn invoke_tool(
@@ -230,7 +227,7 @@ impl AdaptClient {
                 task: None,
             })
             .await
-            .map_err(|e| map_transport_error(e, &self.credential))?;
+            .map_err(|e| AdaptClientError::Auth(auth::map_transport_error(e, &self.credential)))?;
         if result.is_error == Some(true) {
             return Err(capability_failure(
                 capability,
@@ -307,35 +304,6 @@ fn capability_failure(
     }
 }
 
-/// Adapt returns a JSON error body without a `WWW-Authenticate` header for an
-/// invalid session. RMCP 0.16 then attempts to decode that body as JSON-RPC
-/// during initialization, hiding the actionable authentication failure. A
-/// lightweight authenticated GET lets us report the rejected credential first.
-async fn validate_credentials(config: &AdaptConfig) -> Result<(), AdaptClientError> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| map_transport_error(error, &config.bearer_token))?
-        .get(&config.endpoint)
-        .bearer_auth(&config.bearer_token)
-        .send()
-        .await
-        .map_err(|error| map_transport_error(error, &config.bearer_token))?;
-
-    if is_authentication_rejection(response.status()) {
-        Err(AdaptClientError::AuthenticationRejected)
-    } else {
-        Ok(())
-    }
-}
-
-fn is_authentication_rejection(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-    )
-}
-
 fn is_verified_read_only(tool: &rmcp::model::Tool) -> bool {
     VERIFIED_READ_ONLY_CAPABILITIES.contains(&tool.name.as_ref())
         && tool
@@ -349,27 +317,6 @@ fn transport_config(config: &AdaptConfig) -> StreamableHttpClientTransportConfig
     StreamableHttpClientTransportConfig::with_uri(config.endpoint.clone())
         // RMCP adds the `Bearer ` prefix; this value must be the raw session token.
         .auth_header(config.bearer_token.clone())
-}
-
-fn map_transport_error(error: impl std::fmt::Display, credential: &str) -> AdaptClientError {
-    let text = error.to_string();
-    let normalized = text.to_ascii_lowercase();
-    if normalized.contains("auth required")
-        || normalized.contains("insufficient scope")
-        || normalized.contains("status code: 401")
-        || normalized.contains("status code: 403")
-    {
-        AdaptClientError::AuthenticationRejected
-    } else {
-        AdaptClientError::Transport(sanitize_transport_error(&text, credential))
-    }
-}
-
-fn sanitize_transport_error(text: &str, credential: &str) -> String {
-    if credential.is_empty() {
-        return text.to_owned();
-    }
-    text.replace(credential, "[redacted credential]")
 }
 
 fn ensure_ask_adapt_opt_in(allow_unverified: bool) -> Result<(), AdaptClientError> {
@@ -392,46 +339,6 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::sync::Barrier;
-
-    #[test]
-    fn transport_errors_redact_the_credential() {
-        let error = map_transport_error(
-            "request failed for Bearer super-secret-token",
-            "super-secret-token",
-        );
-        let AdaptClientError::Transport(message) = error else {
-            panic!("expected transport error");
-        };
-        assert!(!message.contains("super-secret-token"));
-        assert!(message.contains("[redacted credential]"));
-    }
-
-    #[test]
-    fn authentication_errors_are_classified_consistently() {
-        assert!(matches!(
-            map_transport_error("server returned status code: 401", "secret"),
-            AdaptClientError::AuthenticationRejected
-        ));
-        assert!(matches!(
-            map_transport_error("Auth required", "secret"),
-            AdaptClientError::AuthenticationRejected
-        ));
-        assert!(matches!(
-            map_transport_error("server returned status code: 403", ""),
-            AdaptClientError::AuthenticationRejected
-        ));
-    }
-
-    #[test]
-    fn preflight_recognizes_headerless_authentication_rejections() {
-        assert!(is_authentication_rejection(
-            reqwest::StatusCode::UNAUTHORIZED
-        ));
-        assert!(is_authentication_rejection(reqwest::StatusCode::FORBIDDEN));
-        assert!(!is_authentication_rejection(
-            reqwest::StatusCode::METHOD_NOT_ALLOWED
-        ));
-    }
 
     #[test]
     fn transport_config_passes_raw_token_to_rmcp() {
@@ -607,7 +514,7 @@ mod tests {
             cache
                 .get_or_try_init(|| async move {
                     loads.fetch_add(1, Ordering::SeqCst);
-                    Err(AdaptClientError::Transport("temporary failure".into()))
+                    Err(auth::AuthError::Transport("temporary failure".into()).into())
                 })
                 .await
         };

@@ -1,4 +1,5 @@
 pub mod adapt_client;
+pub mod auth;
 pub mod chat_terminal;
 pub mod config;
 pub mod conversation_controller;

@@ -10,6 +10,8 @@ use crossterm::{
 };
 use serde_json::Value;
 
+use crate::transcript::streaming_chunks;
+
 pub struct Repl<W: Write = io::Stdout> {
     stdout: W,
     waiting: bool,
@@ -451,41 +453,12 @@ fn completed_command(input: &str) -> Option<String> {
     })
 }
 
-fn streaming_chunks(message: &str) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    let mut leading_whitespace = String::new();
-
-    for segment in message.split_inclusive(char::is_whitespace) {
-        if segment.chars().all(char::is_whitespace) {
-            if let Some(last) = chunks.last_mut() {
-                last.push_str(segment);
-            } else {
-                leading_whitespace.push_str(segment);
-            }
-        } else {
-            chunks.push(format!("{leading_whitespace}{segment}"));
-            leading_whitespace.clear();
-        }
-    }
-
-    if !leading_whitespace.is_empty() {
-        if let Some(last) = chunks.last_mut() {
-            last.push_str(&leading_whitespace);
-        } else {
-            chunks.push(leading_whitespace);
-        }
-    }
-
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
         ReplCommand, completed_command, matching_commands, parse_command, shows_command_palette,
-        streaming_chunks,
     };
 
     #[test]
@@ -537,20 +510,6 @@ mod tests {
         assert_eq!(completed_command("/his"), Some("/history".into()));
         assert_eq!(completed_command("/pn"), Some("/open ".into()));
         assert_eq!(completed_command("/history"), None);
-    }
-
-    #[test]
-    fn streaming_chunks_keep_word_boundaries_and_whitespace() {
-        assert_eq!(
-            streaming_chunks("Hello,  world\nfrom Adapt"),
-            vec!["Hello,  ", "world\n", "from ", "Adapt"]
-        );
-    }
-
-    #[test]
-    fn streaming_chunks_handle_empty_and_whitespace_only_messages() {
-        assert!(streaming_chunks("").is_empty());
-        assert_eq!(streaming_chunks("  \n"), vec!["  \n"]);
     }
 
     #[test]
