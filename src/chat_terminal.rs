@@ -326,8 +326,11 @@ impl<W: Write> Repl<W> {
 
 struct LineAwareMessageWriter<'a, W: Write> {
     output: &'a mut W,
+    first_line: bool,
     at_line_start: bool,
     ended_with_newline: bool,
+    pending_carriage_return: bool,
+    saw_input: bool,
 }
 
 impl<'a, W: Write> LineAwareMessageWriter<'a, W> {
@@ -339,34 +342,46 @@ impl<'a, W: Write> LineAwareMessageWriter<'a, W> {
         )?;
         write!(output, "{label}")?;
         execute!(output, SetAttribute(Attribute::Reset))?;
-        write!(output, ": ")?;
         Ok(Self {
             output,
-            at_line_start: false,
+            first_line: true,
+            at_line_start: true,
             ended_with_newline: false,
+            pending_carriage_return: false,
+            saw_input: false,
         })
     }
 
     fn write_text(&mut self, text: &str) -> io::Result<()> {
         for character in text.chars() {
-            if character == '\n' {
-                write!(self.output, "\r\n")?;
-                self.at_line_start = true;
-                self.ended_with_newline = true;
-            } else {
-                if self.at_line_start {
-                    write!(self.output, "  ")?;
+            if self.pending_carriage_return {
+                if character == '\n' {
+                    self.write_newline()?;
+                    self.pending_carriage_return = false;
+                    continue;
                 }
-                write!(self.output, "{character}")?;
-                self.at_line_start = false;
-                self.ended_with_newline = false;
+                self.write_content('\r')?;
+                self.pending_carriage_return = false;
+            }
+            if character == '\r' {
+                self.pending_carriage_return = true;
+            } else if character == '\n' {
+                self.write_newline()?;
+            } else {
+                self.write_content(character)?;
             }
         }
         Ok(())
     }
 
-    fn finish(self) -> io::Result<()> {
+    fn finish(mut self) -> io::Result<()> {
+        if self.pending_carriage_return {
+            self.write_content('\r')?;
+        }
         if !self.ended_with_newline {
+            if !self.saw_input {
+                write!(self.output, ":")?;
+            }
             write!(self.output, "\r\n")?;
         }
         self.output.flush()
@@ -374,6 +389,37 @@ impl<'a, W: Write> LineAwareMessageWriter<'a, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
+    }
+
+    fn write_content(&mut self, character: char) -> io::Result<()> {
+        if self.at_line_start {
+            if self.first_line {
+                write!(self.output, ": ")?;
+            } else {
+                write!(self.output, "  ")?;
+            }
+        }
+        write!(self.output, "{character}")?;
+        self.at_line_start = false;
+        self.ended_with_newline = false;
+        self.saw_input = true;
+        Ok(())
+    }
+
+    fn write_newline(&mut self) -> io::Result<()> {
+        if self.at_line_start {
+            if self.first_line {
+                write!(self.output, ": ")?;
+            } else {
+                write!(self.output, "  ")?;
+            }
+        }
+        write!(self.output, "\r\n")?;
+        self.first_line = false;
+        self.at_line_start = true;
+        self.ended_with_newline = true;
+        self.saw_input = true;
+        Ok(())
     }
 }
 
@@ -521,6 +567,24 @@ mod tests {
         repl.show_adapt("first\nsecond").unwrap();
         let output = visible(&repl.into_output());
         assert!(output.contains("Adapt: first\r\n  second\r\n"));
+    }
+
+    #[test]
+    fn immediate_output_preserves_canonical_line_semantics() {
+        for (message, expected) in [
+            ("", "Adapt:\r\n"),
+            ("first\nsecond", "Adapt: first\r\n  second\r\n"),
+            ("first\r\nsecond", "Adapt: first\r\n  second\r\n"),
+            ("trailing\n", "Adapt: trailing\r\n"),
+        ] {
+            let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+            repl.show_adapt(message).unwrap();
+            let output = visible(&repl.into_output());
+            assert!(
+                output.ends_with(expected),
+                "message {message:?}: {output:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -383,4 +383,19 @@ mod tests {
             ResponsePresentation::Immediate
         );
     }
+
+    #[test]
+    fn configured_delay_survives_disabling_and_reenabling_streaming() {
+        let configured = Duration::from_millis(120);
+        let mut presentation = ResponsePresentation::SimulatedStream { delay: configured };
+
+        presentation = presentation.toggle(configured);
+        assert_eq!(presentation, ResponsePresentation::Immediate);
+
+        presentation = presentation.toggle(configured);
+        assert_eq!(
+            presentation,
+            ResponsePresentation::SimulatedStream { delay: configured }
+        );
+    }
 }
