@@ -32,6 +32,15 @@ pub enum SubmitOutcome {
         error: anyhow::Error,
         persistence_error: crate::session_history::HistoryError,
     },
+    /// The remote continuation attempt failed; the continuation has been dropped and subsequent
+    /// prompts will start a fresh Adapt session.
+    ContinuationFailed {
+        error: anyhow::Error,
+    },
+    ContinuationFailedWithPersistenceWarning {
+        error: anyhow::Error,
+        persistence_error: crate::session_history::HistoryError,
+    },
 }
 
 enum ConversationState<Q> {
@@ -44,6 +53,7 @@ struct ActiveConversation<Q> {
     query: Q,
     session: Session,
     pending_response: Option<crate::session_history::RedactedTranscriptResponse>,
+    continuation_exhausted: bool,
 }
 
 pub struct ConversationController<Q> {
@@ -109,6 +119,7 @@ impl<Q: ConversationQuery> ConversationController<Q> {
             query: connection.query,
             session,
             pending_response: None,
+            continuation_exhausted: false,
         });
         Ok(())
     }
@@ -171,7 +182,12 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         }
         self.history
             .append_prompt(&mut active.session, self.redactor.transcript_text(prompt))?;
-        let continuation = self.history.latest_remote_chat_id(&active.session)?;
+        let continuation = if active.continuation_exhausted {
+            None
+        } else {
+            self.history.latest_remote_chat_id(&active.session)?
+        };
+        let used_continuation = continuation.is_some();
         match active.query.query(prompt, continuation.as_deref()).await {
             Ok(response) => {
                 let response = self.redactor.transcript_response(response);
@@ -191,15 +207,33 @@ impl<Q: ConversationQuery> ConversationController<Q> {
                 }
             }
             Err(error) => {
+                if used_continuation {
+                    active.continuation_exhausted = true;
+                }
                 match self.history.append_error(
                     &mut active.session,
                     self.redactor.transcript_text(&error.to_string()),
                 ) {
-                    Ok(()) => Err(error),
-                    Err(persistence_error) => Ok(SubmitOutcome::ErrorWithPersistenceWarning {
-                        error,
-                        persistence_error,
-                    }),
+                    Ok(()) => {
+                        if used_continuation {
+                            Ok(SubmitOutcome::ContinuationFailed { error })
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    Err(persistence_error) => {
+                        if used_continuation {
+                            Ok(SubmitOutcome::ContinuationFailedWithPersistenceWarning {
+                                error,
+                                persistence_error,
+                            })
+                        } else {
+                            Ok(SubmitOutcome::ErrorWithPersistenceWarning {
+                                error,
+                                persistence_error,
+                            })
+                        }
+                    }
                 }
             }
         }
@@ -243,6 +277,60 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         (SessionHistory::at(&directory), directory)
+    }
+
+    #[tokio::test]
+    async fn continuation_failure_drops_the_continuation_for_subsequent_prompts() {
+        let (history, directory) = history("continuation-failure");
+        let mut origin = history.create().unwrap();
+        let origin_response = Redactor::default().transcript_response(response(Some("chat-1")));
+        history
+            .append_response(&mut origin, origin_response)
+            .unwrap();
+        let mut controller = ConversationController::new(history.clone());
+        controller.open(origin.clone()).unwrap();
+        let calls = Rc::new(RefCell::new(vec![]));
+        let query = Query {
+            calls: calls.clone(),
+            results: Rc::new(RefCell::new(vec![
+                Err(anyhow::anyhow!("session expired")),
+                Ok(response(None)),
+            ])),
+        };
+        controller
+            .connect(Connection {
+                query,
+                redactor: Redactor::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            controller.submit("first").await.unwrap(),
+            SubmitOutcome::ContinuationFailed { .. }
+        ));
+        assert!(matches!(
+            controller.submit("second").await.unwrap(),
+            SubmitOutcome::Response(_)
+        ));
+        assert_eq!(*calls.borrow(), vec![Some("chat-1".into()), None]);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn query_failure_without_continuation_is_a_plain_error() {
+        let (history, directory) = history("plain-error");
+        let mut controller = ConversationController::new(history.clone());
+        let query = Query {
+            calls: Rc::new(RefCell::new(vec![])),
+            results: Rc::new(RefCell::new(vec![Err(anyhow::anyhow!("network error"))])),
+        };
+        controller
+            .connect(Connection {
+                query,
+                redactor: Redactor::default(),
+            })
+            .unwrap();
+        assert!(controller.submit("prompt").await.is_err());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]
