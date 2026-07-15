@@ -3,6 +3,7 @@
 //! This module owns file lifecycle and accepts only redacted transcript data.
 
 use std::{
+    collections::HashSet,
     fmt, fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -145,6 +146,8 @@ pub enum HistoryError {
     InvalidId { id: String },
     #[error("local session history at {path} is malformed")]
     Malformed { path: PathBuf },
+    #[error("local session history contains a cyclic lineage at session `{id}`")]
+    CyclicLineage { id: String },
 }
 
 #[derive(Clone)]
@@ -251,7 +254,13 @@ impl SessionHistory {
     /// whose remote chat ID is absent. Only an empty child inherits its origin's ID.
     pub fn latest_remote_chat_id(&self, session: &Session) -> Result<Option<String>, HistoryError> {
         let mut current = session.clone();
+        let mut visited = HashSet::new();
         loop {
+            if !visited.insert(current.id.clone()) {
+                return Err(HistoryError::CyclicLineage {
+                    id: current.id.to_string(),
+                });
+            }
             if let Some(chat_id) = current.latest_response_remote_chat_id() {
                 return Ok(chat_id.map(str::to_owned));
             }
@@ -287,17 +296,6 @@ impl SessionHistory {
 }
 
 impl Session {
-    /// The latest response is the single source of truth for remote continuation.
-    pub fn latest_remote_chat_id(&self) -> Option<&str> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match &entry.kind {
-                SessionEntryKind::Response(response) => response.remote_chat_id.as_deref(),
-                _ => None,
-            })
-    }
-
     /// `Some(None)` means this session has responded but did not provide a chat ID.
     fn latest_response_remote_chat_id(&self) -> Option<Option<&str>> {
         self.entries
@@ -357,7 +355,10 @@ mod tests {
         let loaded = history.load(&session.id.to_string()).unwrap();
         assert_eq!(loaded.status, SessionStatus::Active);
         assert_eq!(loaded.entries.len(), 3);
-        assert_eq!(loaded.latest_remote_chat_id(), Some("chat-1"));
+        assert_eq!(
+            history.latest_remote_chat_id(&loaded).unwrap(),
+            Some("chat-1".into())
+        );
         history.complete(&mut session).unwrap();
         assert_eq!(
             history.load(&session.id.to_string()).unwrap().status,
@@ -432,6 +433,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(history.latest_remote_chat_id(&continuation).unwrap(), None);
+        let _ = fs::remove_dir_all(directory);
+    }
+    #[test]
+    fn cyclic_lineage_is_rejected() {
+        let (history, directory) = history("cyclic-lineage");
+        let mut first = history.create().unwrap();
+        let second = history.create_continuation(Some(first.id.clone())).unwrap();
+        first.resumed_from_session_id = Some(second.id.clone());
+        history.save(&mut first).unwrap();
+
+        assert!(matches!(
+            history.latest_remote_chat_id(&second),
+            Err(HistoryError::CyclicLineage { .. })
+        ));
         let _ = fs::remove_dir_all(directory);
     }
     #[test]
