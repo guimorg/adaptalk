@@ -1,6 +1,6 @@
-# AdaptTUI Agent Rules
+# adaptalk Agent Rules
 
-AdaptTUI is a Rust terminal client for Adapt's hosted MCP server. The domain glossary is [CONTEXT.md](./CONTEXT.md); keep it glossary-only. Record hard-to-reverse, surprising trade-offs in [docs/adr](./docs/adr).
+adaptalk is a Rust terminal client for Adapt's hosted MCP server. The domain glossary is [CONTEXT.md](./CONTEXT.md); keep it glossary-only. Record hard-to-reverse, surprising trade-offs in [docs/adr](./docs/adr).
 
 Use the Nix development shell for local commands:
 

@@ -134,7 +134,7 @@ impl<W: Write> Repl<W> {
 
     pub fn clear_transcript(&mut self) -> io::Result<()> {
         execute!(self.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-        self.write_plain("AdaptTUI · Read-only mode · Ctrl-C to exit\n")?;
+        self.write_plain("adaptalk · Read-only mode · Ctrl-C to exit\n")?;
         if self.unverified_development_mode {
             self.write_colored(
                 "⚠ DEVELOPMENT MODE: ask_adapt is unverified and may perform mutations.\n",
