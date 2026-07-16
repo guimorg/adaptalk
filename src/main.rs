@@ -8,6 +8,7 @@ use adaptalk::{
     redaction::Redactor,
     session_history::{Session, SessionEntryKind, SessionHistory},
     transcript::{self, TranscriptResponse},
+    update_checker,
 };
 use anyhow::Result;
 use clap::Parser;
@@ -131,6 +132,7 @@ async fn run_prompt(args: &Cli) -> Result<()> {
 
 async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     let mut repl = Repl::start(allow_unverified_ask_adapt)?;
+    let mut updates = update_checker::spawn();
     let history = SessionHistory::for_credential_file(config::default_config_path()?);
     let mut controller = ConversationController::<TerminalQuery>::new(history);
     let mut presentation = ResponsePresentation::SimulatedStream {
@@ -138,6 +140,9 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
     };
     let mut stream_delay = Duration::from_millis(config::DEFAULT_STREAM_DELAY_MS);
     loop {
+        if let Ok(Ok(Some(notice))) = updates.try_recv() {
+            repl.show_update(notice)?;
+        }
         let Some(prompt) = repl.read_prompt()? else {
             return controller.finish();
         };
