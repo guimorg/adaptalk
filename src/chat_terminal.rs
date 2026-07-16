@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use crossterm::{
     cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{self, Clear, ClearType},
@@ -16,6 +19,7 @@ pub struct Repl<W: Write = io::Stdout> {
     stdout: W,
     waiting: bool,
     unverified_development_mode: bool,
+    prompt_anchor_saved: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,11 +56,10 @@ pub fn parse_command(input: &str) -> Option<ReplCommand> {
     }
 }
 
-fn shows_command_palette(input: &str) -> bool {
-    !matching_commands(input).is_empty()
-}
-
 fn matching_commands(input: &str) -> Vec<(&'static str, &'static str)> {
+    if input.contains('\n') {
+        return Vec::new();
+    }
     let Some(query) = input.strip_prefix('/') else {
         return Vec::new();
     };
@@ -95,6 +98,7 @@ impl Repl<io::Stdout> {
             stdout: io::stdout(),
             waiting: false,
             unverified_development_mode,
+            prompt_anchor_saved: false,
         };
         repl.clear_transcript()?;
         Ok(repl)
@@ -107,6 +111,7 @@ impl<W: Write> Repl<W> {
             stdout,
             waiting: false,
             unverified_development_mode,
+            prompt_anchor_saved: false,
         };
         repl.clear_transcript()?;
         Ok(repl)
@@ -130,10 +135,18 @@ impl<W: Write> Repl<W> {
     }
 
     pub fn read_prompt(&mut self) -> io::Result<Option<String>> {
-        self.render_input("", 0)?;
+        self.render_input("")?;
         let _raw_mode = RawModeGuard::enable()?;
+        // Request kitty's keyboard protocol so terminals that support it can
+        // distinguish Shift+Enter from Enter.
+        execute!(
+            self.stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        )?;
         let mut input = String::new();
-        let mut palette_rows = 0;
         loop {
             let Event::Key(key) = event::read()? else {
                 continue;
@@ -142,14 +155,20 @@ impl<W: Write> Repl<W> {
                 continue;
             }
             match key.code {
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    input.push('\n');
+                }
+                // Some terminals encode Shift+Enter as a newline character rather than
+                // KeyCode::Enter with the SHIFT modifier.
+                KeyCode::Char('\n') => input.push('\n'),
                 KeyCode::Enter => {
                     if let Some(completed) = completed_command(&input) {
                         input = completed;
-                        self.render_input(&input, palette_rows)?;
-                        palette_rows = command_palette_rows(&input);
+                        self.render_input(&input)?;
                         continue;
                     }
-                    self.clear_command_palette(palette_rows)?;
+                    self.clear_prompt()?;
+                    execute!(self.stdout, PopKeyboardEnhancementFlags)?;
                     self.write_plain("\r\n")?;
                     return Ok(Some(input.trim().to_owned()));
                 }
@@ -163,12 +182,15 @@ impl<W: Write> Repl<W> {
                 }
                 KeyCode::Esc => input.clear(),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.clear_prompt()?;
+                    execute!(self.stdout, PopKeyboardEnhancementFlags)?;
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
                 }
                 KeyCode::Char('d')
                     if key.modifiers.contains(KeyModifiers::CONTROL) && input.is_empty() =>
                 {
-                    self.clear_command_palette(palette_rows)?;
+                    self.clear_prompt()?;
+                    execute!(self.stdout, PopKeyboardEnhancementFlags)?;
                     self.write_plain("\r\n")?;
                     return Ok(None);
                 }
@@ -177,8 +199,7 @@ impl<W: Write> Repl<W> {
                 }
                 _ => continue,
             }
-            self.render_input(&input, palette_rows)?;
-            palette_rows = command_palette_rows(&input);
+            self.render_input(&input)?;
         }
     }
 
@@ -250,17 +271,29 @@ impl<W: Write> Repl<W> {
         Ok(())
     }
 
-    fn render_input(&mut self, input: &str, previous_palette_rows: u16) -> io::Result<()> {
-        execute!(self.stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-        self.write_label("You", Color::Cyan)?;
-        self.write_plain(" › ")?;
-        self.write_plain(input)?;
-        self.clear_command_palette(previous_palette_rows)?;
-        let commands = matching_commands(input);
-        if shows_command_palette(input) {
+    fn render_input(&mut self, input: &str) -> io::Result<()> {
+        if self.prompt_anchor_saved {
             execute!(
                 self.stdout,
-                SavePosition,
+                RestorePosition,
+                Clear(ClearType::FromCursorDown)
+            )?;
+        } else {
+            execute!(self.stdout, SavePosition)?;
+            self.prompt_anchor_saved = true;
+        }
+        self.write_label("You", Color::Cyan)?;
+        self.write_plain(" › ")?;
+        for (index, line) in input.split('\n').enumerate() {
+            if index > 0 {
+                self.write_plain("\r\n      ")?;
+            }
+            self.write_plain(line)?;
+        }
+        let commands = matching_commands(input);
+        if !commands.is_empty() {
+            execute!(
+                self.stdout,
                 MoveDown(1),
                 MoveToColumn(0),
                 Clear(ClearType::CurrentLine)
@@ -276,22 +309,18 @@ impl<W: Write> Repl<W> {
                 self.write_colored(&format!("  {command:<12}"), Color::Cyan)?;
                 self.write_colored(description, Color::DarkGrey)?;
             }
-            execute!(self.stdout, RestorePosition)?;
         }
         self.stdout.flush()
     }
 
-    fn clear_command_palette(&mut self, rows: u16) -> io::Result<()> {
-        if rows > 0 {
-            for _ in 0..rows {
-                execute!(
-                    self.stdout,
-                    MoveDown(1),
-                    MoveToColumn(0),
-                    Clear(ClearType::CurrentLine)
-                )?;
-            }
-            execute!(self.stdout, MoveUp(rows))?;
+    fn clear_prompt(&mut self) -> io::Result<()> {
+        if self.prompt_anchor_saved {
+            execute!(
+                self.stdout,
+                RestorePosition,
+                Clear(ClearType::FromCursorDown)
+            )?;
+            self.prompt_anchor_saved = false;
         }
         Ok(())
     }
@@ -425,18 +454,6 @@ impl<'a, W: Write> LineAwareMessageWriter<'a, W> {
     }
 }
 
-fn command_palette_rows(input: &str) -> u16 {
-    let count: u16 = matching_commands(input)
-        .len()
-        .try_into()
-        .unwrap_or(u16::MAX);
-    if count == 0 {
-        0
-    } else {
-        count.saturating_add(1)
-    }
-}
-
 fn completed_command(input: &str) -> Option<String> {
     if input.chars().any(char::is_whitespace) {
         return None;
@@ -457,9 +474,7 @@ fn completed_command(input: &str) -> Option<String> {
 mod tests {
     use std::time::Duration;
 
-    use super::{
-        ReplCommand, completed_command, matching_commands, parse_command, shows_command_palette,
-    };
+    use super::{ReplCommand, completed_command, matching_commands, parse_command};
 
     #[test]
     fn recognizes_history_and_open_commands() {
@@ -477,14 +492,15 @@ mod tests {
 
     #[test]
     fn slash_opens_the_command_palette() {
-        assert!(shows_command_palette("/"));
-        assert!(shows_command_palette("/his"));
-        assert!(shows_command_palette("/ope"));
-        assert!(shows_command_palette("/history"));
-        assert!(shows_command_palette("/stream"));
-        assert!(!shows_command_palette("/unknown"));
-        assert!(!shows_command_palette(""));
-        assert!(!shows_command_palette("ask Adapt"));
+        assert!(!matching_commands("/").is_empty());
+        assert!(!matching_commands("/his").is_empty());
+        assert!(!matching_commands("/ope").is_empty());
+        assert!(!matching_commands("/history").is_empty());
+        assert!(!matching_commands("/stream").is_empty());
+        assert!(matching_commands("/unknown").is_empty());
+        assert!(matching_commands("").is_empty());
+        assert!(matching_commands("ask Adapt").is_empty());
+        assert!(matching_commands("/history\nmore").is_empty());
     }
 
     #[test]
