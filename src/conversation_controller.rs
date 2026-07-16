@@ -171,7 +171,12 @@ impl<Q: ConversationQuery> ConversationController<Q> {
         Ok(active.pending_response.take().is_some())
     }
 
-    pub async fn submit(&mut self, prompt: &str) -> Result<SubmitOutcome> {
+    /// Persist the original user input while submitting the resolved outbound prompt.
+    pub async fn submit(
+        &mut self,
+        original_prompt: &str,
+        outbound_prompt: &str,
+    ) -> Result<SubmitOutcome> {
         let ConversationState::Connected(active) = &mut self.state else {
             anyhow::bail!("a connection is required before submitting a prompt");
         };
@@ -180,15 +185,21 @@ impl<Q: ConversationQuery> ConversationController<Q> {
                 "the previous remote response could not be saved; retry persistence or abandon this session before submitting again"
             );
         }
-        self.history
-            .append_prompt(&mut active.session, self.redactor.transcript_text(prompt))?;
+        self.history.append_prompt(
+            &mut active.session,
+            self.redactor.transcript_text(original_prompt),
+        )?;
         let continuation = if active.continuation_exhausted {
             None
         } else {
             self.history.latest_remote_chat_id(&active.session)?
         };
         let used_continuation = continuation.is_some();
-        match active.query.query(prompt, continuation.as_deref()).await {
+        match active
+            .query
+            .query(outbound_prompt, continuation.as_deref())
+            .await
+        {
             Ok(response) => {
                 let response = self.redactor.transcript_response(response);
                 let display = response.as_inner().clone();
@@ -302,11 +313,11 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            controller.submit("first").await.unwrap(),
+            controller.submit("first", "first").await.unwrap(),
             SubmitOutcome::ContinuationFailed { .. }
         ));
         assert!(matches!(
-            controller.submit("second").await.unwrap(),
+            controller.submit("second", "second").await.unwrap(),
             SubmitOutcome::Response(_)
         ));
         assert_eq!(*calls.borrow(), vec![Some("chat-1".into()), None]);
@@ -327,7 +338,7 @@ mod tests {
                 redactor: Redactor::default(),
             })
             .unwrap();
-        assert!(controller.submit("prompt").await.is_err());
+        assert!(controller.submit("prompt", "prompt").await.is_err());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -348,8 +359,11 @@ mod tests {
             results: Rc::new(RefCell::new(vec![Ok(response(None)), Ok(response(None))])),
         };
         controller.connect(Connection { query, redactor }).unwrap();
-        controller.submit("next").await.unwrap();
-        controller.submit("after missing chat ID").await.unwrap();
+        controller.submit("next", "next").await.unwrap();
+        controller
+            .submit("after missing chat ID", "after missing chat ID")
+            .await
+            .unwrap();
         let sessions = history.list().unwrap();
         assert!(
             sessions
@@ -374,7 +388,7 @@ mod tests {
                 redactor: Redactor::default(),
             })
             .unwrap();
-        assert!(controller.submit("prompt").await.is_err());
+        assert!(controller.submit("prompt", "prompt").await.is_err());
         assert!(!controller.needs_connection());
         assert!(
             history
@@ -424,6 +438,56 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CapturingQuery {
+        prompts: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ConversationQuery for CapturingQuery {
+        fn query<'a>(&'a self, prompt: &'a str, _continuation: Option<&'a str>) -> QueryFuture<'a> {
+            self.prompts.borrow_mut().push(prompt.into());
+            Box::pin(async { Ok(response(None)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_original_prompt_while_submitting_outbound_prompt() {
+        let (history, directory) = history("outbound-prompt");
+        let prompts = Rc::new(RefCell::new(vec![]));
+        let mut controller = ConversationController::new(history.clone());
+        controller
+            .connect(Connection {
+                query: CapturingQuery {
+                    prompts: prompts.clone(),
+                },
+                redactor: Redactor::default(),
+            })
+            .unwrap();
+
+        controller
+            .submit(
+                "review @notes.md",
+                "review <file path=\"@notes.md\">\nnotes\n</file>",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *prompts.borrow(),
+            vec!["review <file path=\"@notes.md\">\nnotes\n</file>"]
+        );
+        assert!(history.list().unwrap().iter().any(|session| {
+            session.entries().iter().any(|entry| {
+                matches!(
+                    entry.kind(),
+                    crate::session_history::SessionEntryKind::Prompt { text }
+                        if text == "review @notes.md"
+                )
+            })
+        }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     #[tokio::test]
     async fn remote_success_with_a_history_write_failure_is_not_an_error() {
         let (history, directory) = history("response-save-failure");
@@ -439,10 +503,15 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            controller.submit("prompt").await.unwrap(),
+            controller.submit("prompt", "prompt").await.unwrap(),
             SubmitOutcome::ResponseWithPersistenceWarning { .. }
         ));
-        assert!(controller.submit("another prompt").await.is_err());
+        assert!(
+            controller
+                .submit("another prompt", "another prompt")
+                .await
+                .is_err()
+        );
         assert!(controller.finish().is_err());
         assert!(controller.abandon_pending_response().unwrap());
         std::fs::remove_file(directory).unwrap();
@@ -462,8 +531,8 @@ mod tests {
         };
         let mut controller = ConversationController::new(history.clone());
         controller.connect(Connection { query, redactor }).unwrap();
-        controller.submit("first").await.unwrap();
-        controller.submit("second").await.unwrap();
+        controller.submit("first", "first").await.unwrap();
+        controller.submit("second", "second").await.unwrap();
         assert_eq!(*calls.borrow(), vec![None, Some("chat-1".into())]);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -490,7 +559,8 @@ mod tests {
             })
             .unwrap();
 
-        let SubmitOutcome::Response(display) = controller.submit("prompt").await.unwrap() else {
+        let SubmitOutcome::Response(display) = controller.submit("prompt", "prompt").await.unwrap()
+        else {
             panic!("response persistence should succeed");
         };
         assert!(!format!("{display:?}").contains(secret));
@@ -511,11 +581,11 @@ mod tests {
                 redactor: Redactor::default(),
             })
             .unwrap();
-        controller.submit("first").await.unwrap();
+        controller.submit("first", "first").await.unwrap();
         controller.finish().unwrap();
 
         assert!(controller.needs_connection());
-        assert!(controller.submit("second").await.is_err());
+        assert!(controller.submit("second", "second").await.is_err());
         assert!(
             history.list().unwrap().iter().all(
                 |session| session.status() == &crate::session_history::SessionStatus::Completed
@@ -540,14 +610,14 @@ mod tests {
                 redactor: Redactor::default(),
             })
             .unwrap();
-        controller.submit("first").await.unwrap();
+        controller.submit("first", "first").await.unwrap();
 
         std::fs::remove_dir_all(&directory).unwrap();
         std::fs::write(&directory, "not a directory").unwrap();
         assert!(controller.finish().is_err());
         std::fs::remove_file(&directory).unwrap();
 
-        controller.submit("second").await.unwrap();
+        controller.submit("second", "second").await.unwrap();
         assert!(
             history
                 .list()

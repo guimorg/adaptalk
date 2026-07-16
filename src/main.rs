@@ -5,6 +5,7 @@ use adaptalk::{
     conversation_controller::{
         Connection, ConversationController, ConversationQuery, QueryFuture, SubmitOutcome,
     },
+    file_references::FileReferenceResolver,
     redaction::Redactor,
     session_history::{Session, SessionEntryKind, SessionHistory},
     transcript::{self, TranscriptResponse},
@@ -186,6 +187,15 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
             }
             continue;
         }
+        let outbound_prompt = match FileReferenceResolver::for_current_dir()
+            .and_then(|resolver| resolver.resolve(&prompt))
+        {
+            Ok(outbound_prompt) => outbound_prompt,
+            Err(error) => {
+                repl.show_error(&format!("prompt error: {error}"))?;
+                continue;
+            }
+        };
         repl.show_working()?;
         if controller.needs_connection() {
             let terminal_connection = match connect_terminal(allow_unverified_ask_adapt).await {
@@ -202,7 +212,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 continue;
             }
         }
-        let result = controller.submit(&prompt).await;
+        let result = controller.submit(&prompt, &outbound_prompt).await;
         match result {
             Ok(SubmitOutcome::Response(response)) => {
                 render_response(&mut repl, response, presentation).await?
