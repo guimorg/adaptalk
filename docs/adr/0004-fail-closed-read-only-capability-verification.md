@@ -10,7 +10,7 @@ Adapt currently exposes `ask_adapt`, but it is not guaranteed to be non-mutating
 
 ## Decision
 
-AdaptTUI requires both an explicit `readOnlyHint: true` annotation and an Adapt-specific verified capability name before exposing or invoking a capability. The verified list is empty until Adapt provides a documented, verified non-mutating capability. `ask_adapt` is rejected by the normal query path even if it claims to be read-only.
+adaptalk requires both an explicit `readOnlyHint: true` annotation and an Adapt-specific verified capability name before exposing or invoking a capability. The verified list is empty until Adapt provides a documented, verified non-mutating capability. `ask_adapt` is rejected by the normal query path even if it claims to be read-only.
 
 As a temporary development exception, the process-only `--allow-unverified-ask-adapt` flag permits the narrowly scoped `ask_adapt` query method. The CLI must print a warning that the capability is not verified as read-only and may perform mutations. The flag does not authorize arbitrary unverified capabilities and is never persisted.
 

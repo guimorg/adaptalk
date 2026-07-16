@@ -2,7 +2,7 @@
 
 A small Rust terminal REPL for using Adapt through its hosted MCP server.
 
-> AdaptTUI is read-only by default: it exposes only MCP capabilities explicitly marked `readOnlyHint: true`. Mutating and ambiguously classified capabilities are rejected.
+> adaptalk is read-only by default: it exposes only MCP capabilities explicitly marked `readOnlyHint: true`. Mutating and ambiguously classified capabilities are rejected.
 
 **Requirements:** Rust 1.85 or later (edition 2024).
 
@@ -56,7 +56,7 @@ just check
 
 ## Configuration
 
-AdaptTUI reads its bearer token from `~/.adapt/config.toml`:
+adaptalk reads its bearer token from `~/.adapt/config.toml`:
 
 ```toml
 bearer_token = "paste-your-bearer-token-here"
@@ -77,7 +77,7 @@ chmod 600 ~/.adapt/config.toml
 
 To get a bearer token, sign in to Adapt and follow the token setup instructions in the [Adapt MCP Server documentation](https://adapt.com/docs/platform/mcp-server). Copy the token into `~/.adapt/config.toml`; do not commit the file or paste the token into source code, logs, or session history.
 
-AdaptTUI requires an `https://` endpoint because the bearer token is sent as authentication data. The `endpoint` setting is optional and is intended for an HTTPS Adapt endpoint such as a staging environment.
+adaptalk requires an `https://` endpoint because the bearer token is sent as authentication data. The `endpoint` setting is optional and is intended for an HTTPS Adapt endpoint such as a staging environment.
 
 ## Using the Terminal REPL
 
@@ -87,13 +87,13 @@ After configuring a token, start the interactive REPL with:
 cargo run
 ```
 
-AdaptTUI first connects to the Adapt MCP Server and discovers capabilities, then prints a compact terminal prompt. Type at the `You ›` prompt and press Enter to submit it. Your prompt is cyan, Adapt replies are magenta, and the normal terminal scrollback preserves the conversation.
+adaptalk first connects to the Adapt MCP Server and discovers capabilities, then prints a compact terminal prompt. Type at the `You ›` prompt and press Enter to submit it. Your prompt is cyan, Adapt replies are magenta, and the normal terminal scrollback preserves the conversation.
 
 - Use your terminal's normal scrolling controls to browse the conversation.
 - Press Ctrl-C to exit.
-- AdaptTUI invokes only capabilities verified as read-only. If none are available, the terminal displays that error rather than invoking an ambiguous capability.
+- adaptalk invokes only capabilities verified as read-only. If none are available, the terminal displays that error rather than invoking an ambiguous capability.
 
-After a successful connection, AdaptTUI saves a redacted JSON snapshot after every prompt and response in `~/.adapt/sessions/` (next to, but separate from, `~/.adapt/config.toml`). A session left running by Ctrl-C or process termination is shown as **interrupted** and can still be read. The configured bearer token, bearer strings, and common sensitive JSON fields are redacted before anything is written.
+After a successful connection, adaptalk saves a redacted JSON snapshot after every prompt and response in `~/.adapt/sessions/` (next to, but separate from, `~/.adapt/config.toml`). A session left running by Ctrl-C or process termination is shown as **interrupted** and can still be read. The configured bearer token, bearer strings, and common sensitive JSON fields are redacted before anything is written.
 
 Two REPL commands work entirely locally, before any configuration is read or MCP connection is made:
 

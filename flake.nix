@@ -1,5 +1,5 @@
 {
-  description = "AdaptTUI Rust development environment";
+  description = "adaptalk Rust development environment";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";

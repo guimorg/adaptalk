@@ -1,6 +1,6 @@
-# AdaptTUI
+# adaptalk
 
-AdaptTUI is a local interactive client for using Adapt through its hosted MCP service.
+adaptalk is a local interactive client for using Adapt through its hosted MCP service.
 
 ## Language
 
@@ -12,7 +12,7 @@ _Avoid_: AdaptUI, Slack bot
 The hosted Model Context Protocol service through which external clients discover and invoke Adapt capabilities.
 _Avoid_: Adapt API, Slack integration
 
-**AdaptTUI**:
+**adaptalk**:
 The local terminal application that connects a user to Adapt through the Adapt MCP Server.
 _Avoid_: Adapt server, Adapt clone, AdaptUI
 
@@ -25,7 +25,7 @@ One natural-language request submitted by the user within an Adapt Session.
 _Avoid_: Tool command, MCP request
 
 **Terminal REPL**:
-The minimal AdaptTUI interaction surface: a line-oriented prompt and colored conversation output preserved in native terminal scrollback, with structured read-only results shown inline.
+The minimal adaptalk interaction surface: a line-oriented prompt and colored conversation output preserved in native terminal scrollback, with structured read-only results shown inline.
 _Avoid_: Dashboard, tool browser
 
 **Action Approval**:

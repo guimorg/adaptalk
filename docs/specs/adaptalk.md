@@ -1,4 +1,4 @@
-# AdaptTUI Specification
+# adaptalk Specification
 
 ## Problem Statement
 
@@ -8,9 +8,9 @@ The user needs a small Rust terminal client that provides a direct, chat-first c
 
 ## Solution
 
-Build AdaptTUI, a thin Rust terminal REPL for Adapt.
+Build adaptalk, a thin Rust terminal REPL for Adapt.
 
-AdaptTUI connects to Adapt's hosted MCP endpoint using a bearer token stored in the user's local `.adapt` configuration area. It initializes the MCP connection, discovers available capabilities, permits only capabilities verified as non-mutating, and presents a chat-first terminal interaction.
+adaptalk connects to Adapt's hosted MCP endpoint using a bearer token stored in the user's local `.adapt` configuration area. It initializes the MCP connection, discovers available capabilities, permits only capabilities verified as non-mutating, and presents a chat-first terminal interaction.
 
 The Terminal REPL accepts natural-language prompts and prints colored conversation output into native terminal scrollback. It displays structured read-only results and citations inline, and shows a working state while a request is pending. Every Adapt Session is persisted under the local `.adapt/sessions/` area so users can browse and reopen history. Reopening a transcript must always work locally; true remote continuation is supported only when Adapt exposes a stable remote session identifier.
 
@@ -18,22 +18,22 @@ The first implementation milestone is a connectivity slice: authenticate, initia
 
 ## User Stories
 
-1. As an engineer, I want to launch AdaptTUI from my terminal, so that I can use Adapt without opening Slack or a browser.
-2. As an engineer, I want AdaptTUI to connect to Adapt's hosted MCP Server, so that Adapt remains responsible for connected-tool access and reasoning.
+1. As an engineer, I want to launch adaptalk from my terminal, so that I can use Adapt without opening Slack or a browser.
+2. As an engineer, I want adaptalk to connect to Adapt's hosted MCP Server, so that Adapt remains responsible for connected-tool access and reasoning.
 3. As an engineer, I want to configure a bearer token locally, so that I can authenticate without entering it for every session.
 4. As an engineer, I want the bearer token kept separate from session history, so that sharing or inspecting transcripts does not expose credentials.
 5. As an engineer, I want the default Adapt endpoint to work without extra configuration, so that the first run is straightforward.
 6. As an engineer, I want to override the endpoint locally, so that I can test staging or a future endpoint without changing the binary.
-7. As an engineer, I want AdaptTUI to fail clearly when credentials are absent or invalid, so that authentication problems are distinguishable from MCP failures.
-8. As an engineer, I want AdaptTUI to complete MCP initialization before showing the chat as ready, so that requests cannot race an unready connection.
-9. As an engineer, I want AdaptTUI to discover the server's capabilities, so that the client can adapt to the current MCP contract.
-10. As an engineer, I want AdaptTUI to show a simple chat prompt input, so that natural-language questions are the primary interaction.
+7. As an engineer, I want adaptalk to fail clearly when credentials are absent or invalid, so that authentication problems are distinguishable from MCP failures.
+8. As an engineer, I want adaptalk to complete MCP initialization before showing the chat as ready, so that requests cannot race an unready connection.
+9. As an engineer, I want adaptalk to discover the server's capabilities, so that the client can adapt to the current MCP contract.
+10. As an engineer, I want adaptalk to show a simple chat prompt input, so that natural-language questions are the primary interaction.
 11. As an engineer, I want to submit a Chat Prompt and see it in the transcript, so that the conversation remains understandable while a response is pending.
 12. As an engineer, I want response content to stream into the transcript, so that I can begin reading without waiting for the complete answer.
 13. As an engineer, I want a clear loading or completion state when streaming is unavailable, so that non-streaming responses remain understandable.
-14. As an engineer, I want AdaptTUI to render structured MCP results inline, so that tables, source references, and other useful data are not reduced to opaque raw JSON.
+14. As an engineer, I want adaptalk to render structured MCP results inline, so that tables, source references, and other useful data are not reduced to opaque raw JSON.
 15. As an engineer, I want citations visible with the relevant response, so that I can inspect the source behind an answer.
-16. As an engineer, I want AdaptTUI to permit only verified non-mutating capabilities, so that the first release cannot change external systems.
+16. As an engineer, I want adaptalk to permit only verified non-mutating capabilities, so that the first release cannot change external systems.
 17. As an engineer, I want capabilities with unclear mutation behavior rejected or hidden, so that the read-only guarantee fails closed.
 18. As an engineer, I want no action approval flow in the first release, so that the product boundary remains strictly read-only.
 19. As an engineer, I want each completed Adapt Session saved locally, so that useful conversations survive process exit.
@@ -56,14 +56,14 @@ The first implementation milestone is a connectivity slice: authenticate, initia
 
 ## Implementation Decisions
 
-- AdaptTUI is a thin Adapt Client, not a reimplementation of Adapt and not a general-purpose MCP client.
+- adaptalk is a thin Adapt Client, not a reimplementation of Adapt and not a general-purpose MCP client.
 - The first release is chat-first and presents a minimal Terminal REPL rather than a dashboard, tool browser, or command catalog.
 - The first release is strictly read-only. Only verified non-mutating MCP capabilities may be exposed or invoked. Unknown or ambiguous capabilities fail closed.
 - Mutating operations and approval workflows are out of the first release.
 - Adapt's hosted MCP endpoint is the default endpoint. A local configuration override is supported for testing and future endpoint changes, while arbitrary third-party MCP servers remain out of scope.
 - Bearer-token authentication is persisted in the user-local `.adapt` configuration area, separate from session history. Tokens are never written to transcripts, logs, or terminal output, and credential files use restrictive permissions where supported.
 - Local Adapt History is persisted under `.adapt/sessions/`. History is a local transcript archive and may also carry a remote session identifier when Adapt supplies one.
-- Reopening a local transcript is always supported. Remote continuation is conditional on a stable Adapt session identifier; without one, AdaptTUI starts a new remote Adapt Session and only uses prior context when explicitly requested.
+- Reopening a local transcript is always supported. Remote continuation is conditional on a stable Adapt session identifier; without one, adaptalk starts a new remote Adapt Session and only uses prior context when explicitly requested.
 - The MCP client uses the official Rust RMCP SDK and keeps transport/protocol details behind an Adapt-specific client adapter.
 - The REPL uses Crossterm for terminal styling and cursor control. Tokio provides the asynchronous runtime needed for MCP work.
 - The REPL shows `Adapt: is typing…` while a request is pending. Completed responses are mock-streamed into the terminal by default in word-sized chunks; `/stream` toggles this presentation behavior for the current process, and `stream_delay_ms` configures the pacing. Real MCP progress-event streaming remains a future client enhancement.
@@ -91,7 +91,7 @@ The first implementation milestone is a connectivity slice: authenticate, initia
 - Encrypting local history beyond the operating system's normal filesystem controls.
 - Automatically injecting prior transcripts into new prompts.
 - Assuming that a local transcript is equivalent to a live remote Adapt conversation.
-- Deployment infrastructure, containers, Kubernetes, or a hosted service for AdaptTUI.
+- Deployment infrastructure, containers, Kubernetes, or a hosted service for adaptalk.
 
 ## Further Notes
 

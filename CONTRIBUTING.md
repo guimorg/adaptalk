@@ -1,4 +1,4 @@
-# Contributing to AdaptTUI
+# Contributing to adaptalk
 
 ## Setup
 
