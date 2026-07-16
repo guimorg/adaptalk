@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
+use crate::transcript::streaming_chunks;
+use crate::update_checker::UpdateNotice;
 use crossterm::{
     cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition},
     event::{
@@ -13,13 +15,13 @@ use crossterm::{
 };
 use serde_json::Value;
 
-use crate::transcript::streaming_chunks;
-
 pub struct Repl<W: Write = io::Stdout> {
     stdout: W,
     waiting: bool,
     unverified_development_mode: bool,
     prompt_anchor_saved: bool,
+    update_notice: Option<UpdateNotice>,
+    update_dismissed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -99,6 +101,8 @@ impl Repl<io::Stdout> {
             waiting: false,
             unverified_development_mode,
             prompt_anchor_saved: false,
+            update_notice: None,
+            update_dismissed: false,
         };
         repl.clear_transcript()?;
         Ok(repl)
@@ -112,6 +116,8 @@ impl<W: Write> Repl<W> {
             waiting: false,
             unverified_development_mode,
             prompt_anchor_saved: false,
+            update_notice: None,
+            update_dismissed: false,
         };
         repl.clear_transcript()?;
         Ok(repl)
@@ -119,6 +125,11 @@ impl<W: Write> Repl<W> {
 
     pub fn into_output(self) -> W {
         self.stdout
+    }
+
+    pub fn show_update(&mut self, notice: UpdateNotice) -> io::Result<()> {
+        self.update_notice = Some(notice);
+        self.write_message("Update", Color::Green, self.update_banner_text().as_str())
     }
 
     pub fn clear_transcript(&mut self) -> io::Result<()> {
@@ -129,6 +140,9 @@ impl<W: Write> Repl<W> {
                 "⚠ DEVELOPMENT MODE: ask_adapt is unverified and may perform mutations.\n",
                 Color::Yellow,
             )?;
+        }
+        if self.update_notice.is_some() && !self.update_dismissed {
+            self.write_colored(&format!("{}\n", self.update_banner_text()), Color::Green)?;
         }
         self.waiting = false;
         Ok(())
@@ -180,6 +194,7 @@ impl<W: Write> Repl<W> {
                         input = completed;
                     }
                 }
+                KeyCode::Esc if input.is_empty() => self.update_dismissed = true,
                 KeyCode::Esc => input.clear(),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.clear_prompt()?;
@@ -284,6 +299,9 @@ impl<W: Write> Repl<W> {
         }
         self.write_label("You", Color::Cyan)?;
         self.write_plain(" › ")?;
+        if self.update_notice.is_some() && !self.update_dismissed {
+            self.write_colored("[update available] ", Color::Green)?;
+        }
         for (index, line) in input.split('\n').enumerate() {
             if index > 0 {
                 self.write_plain("\r\n      ")?;
@@ -329,6 +347,14 @@ impl<W: Write> Repl<W> {
         let mut writer = LineAwareMessageWriter::start(&mut self.stdout, label, color)?;
         writer.write_text(message)?;
         writer.finish()
+    }
+
+    fn update_banner_text(&self) -> String {
+        let notice = self.update_notice.as_ref().expect("update notice exists");
+        format!(
+            "Update available: Adaptalk {} (installed {}). See: {}",
+            notice.available, notice.installed, notice.url
+        )
     }
 
     fn write_label(&mut self, label: &str, color: Color) -> io::Result<()> {

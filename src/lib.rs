@@ -6,3 +6,4 @@ pub mod conversation_controller;
 pub mod redaction;
 pub mod session_history;
 pub mod transcript;
+pub mod update_checker;
