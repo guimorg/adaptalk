@@ -3,6 +3,7 @@ pub mod auth;
 pub mod chat_terminal;
 pub mod config;
 pub mod conversation_controller;
+pub mod file_references;
 pub mod redaction;
 pub mod session_history;
 pub mod transcript;
