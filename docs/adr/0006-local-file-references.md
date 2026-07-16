@@ -112,12 +112,13 @@ The following are explicitly outside this decision:
 - user-editable deny-lists; and
 - regex-based redaction of file contents.
 
-These may be reconsidered in separate ADRs. If interactive path suggestions
-are added, they must apply the same canonicalization and deny-list policy and
-must avoid exposing protected directory contents. In particular, regex
-redaction is rejected as a security boundary because it cannot reliably
-identify secrets; deny-listing and the existing credential redaction boundary
-remain the controls for this first version.
+These features are out of scope for this decision and are not part of ATUI-8.
+If interactive path suggestions are added later, they must apply the same
+canonicalization and deny-list policy and must avoid exposing protected
+directory contents. In particular, regex redaction is rejected as a security
+boundary because it cannot reliably identify secrets; deny-listing and the
+existing credential redaction boundary remain the controls for this first
+version.
 
 ## Consequences
 
