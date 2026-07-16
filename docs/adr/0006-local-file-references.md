@@ -2,7 +2,7 @@
 
 ## Status
 
-Pending
+Accepted, with staged implementation
 
 ## Context
 
@@ -18,25 +18,19 @@ files, or change the read-only boundary of the Adapt MCP Server.
 
 ## Decision
 
-### Accepted path forms
+### ATUI-8 path forms
 
-An explicit local reference may name:
-
-- a path relative to the current working directory (CWD);
-- an absolute path; or
-- a path beginning with `~`, expanded using the user's home directory.
-
-After `~` expansion and relative-path resolution, adaptalk canonicalizes the
-path before applying any security check. The canonical path is the path used
-for deny-list comparison, size checks, reading, and the emitted `file path`
-attribute. Missing paths, paths that cannot be canonicalized, and paths that
-resolve outside the permitted local-file policy are rejected.
+ATUI-8 accepts only paths relative to the current working directory (CWD).
+Absolute paths, paths beginning with `~`, and any path containing a `..`
+component are rejected. Before every safety check, adaptalk canonicalizes the
+candidate and requires the canonical path to remain under the canonical CWD.
+This prevents symlink escapes.
 
 ### Syntax and parsing
 
-The supported forms are a bare reference such as `@README.md` and a quoted
-reference such as `@"path with spaces.md"`. A literal at-sign is written
-`\@`.
+ATUI-8 supports only whitespace-delimited bare references such as `@README.md`
+and `@./notes/file.md`. Quoted references, escaped at-signs, and path
+completion are deferred.
 
 An `@` in the middle of a word and a trailing `@` are literal text. The
 parser must not interpret an arbitrary email address, mention-like token, or
@@ -51,36 +45,36 @@ interactive completion UI.
 
 ### Expansion
 
-Each reference is replaced with a block containing the canonical file path
+Each reference is replaced with a block containing the user-typed reference
 and the file contents:
 
 ```text
-<file path="/canonical/path/to/README.md">
+<file path="@README.md">
 file contents
 </file>
 ```
 
 The path attribute is escaped for the block's syntax, and file contents are
-inserted as text without interpreting their contents as additional
-references. Expansion is silent: the user sees the resulting prompt and
-response flow, not a separate progress message or file-content dump. Errors
-are reported as prompt errors without exposing credential material.
+inserted as text without interpreting their contents as additional references.
+Canonical paths remain mandatory for all safety checks. A later broadening of
+the syntax may emit canonical paths, but ATUI-8 preserves the typed reference
+outwardly. Expansion is silent. Errors are reported as prompt errors without
+exposing credential material.
 
 ### Safety and resource policy
 
 The implementation applies checks in this order:
 
-1. resolve `~` and CWD-relative paths;
-2. canonicalize the path;
+1. resolve the CWD-relative path;
+2. canonicalize the path before every safety check;
 3. compare the canonical path against the built-in deny-list;
 4. inspect metadata and reject files over the configured maximum size (and
    non-regular files); and
 5. read the file and construct the expansion block.
 
 The deny-list is built in, fixed by the application, and compared against
-canonical paths. It covers credential/configuration locations and other
-known secret-bearing local state, including Adapt credentials and
-`.adapt/sessions/`. Users cannot edit or disable it through this feature.
+canonical paths. ATUI-8 denies `~/.adapt/config.toml` and every path under
+`~/.adapt/sessions/`. Users cannot edit or disable it through this feature.
 Credential values must never appear in terminal output, transcripts, or logs.
 
 If any reference in a prompt fails parsing, security checks, size checks, or
@@ -127,7 +121,6 @@ and read-only policy remain unchanged. Canonicalization-before-checking makes
 security decisions consistent across aliases and symlinks, while the
 all-or-nothing rule avoids sending incomplete prompts.
 
-The parser, path policy, expansion formatter, and history behavior will need
-focused tests before implementation. A maximum file size and the exact
-built-in deny-list entries must be chosen in the ATUI-8 implementation and
-documented there or in a follow-up ADR if they become durable policy.
+ATUI-8 permits regular UTF-8 files of at most 1 MiB, including exactly 1 MiB.
+The parser, path policy, expansion formatter, and history behavior need
+focused tests before later path forms are introduced.
