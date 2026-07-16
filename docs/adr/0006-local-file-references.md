@@ -44,6 +44,11 @@ unfinished trailing marker as a file reference. Quoted references may contain
 spaces; an unterminated quoted reference is invalid rather than partially
 expanded.
 
+References are resolved only when the user submits a complete Chat Prompt.
+Typing `@` does not inspect the filesystem or show path suggestions. A lone
+or trailing `@` therefore remains literal text, and ATUI-8 does not include an
+interactive completion UI.
+
 ### Expansion
 
 Each reference is replaced with a block containing the canonical file path
@@ -103,13 +108,16 @@ The following are explicitly outside this decision:
 - adapting adaptalk into an MCP server;
 - connecting to local MCP servers;
 - globbing or wildcard expansion;
+- interactive path suggestions or completion while typing;
 - user-editable deny-lists; and
 - regex-based redaction of file contents.
 
-These may be reconsidered in separate ADRs. In particular, regex redaction
-is rejected as a security boundary because it cannot reliably identify
-secrets; deny-listing and the existing credential redaction boundary remain
-the controls for this first version.
+These may be reconsidered in separate ADRs. If interactive path suggestions
+are added, they must apply the same canonicalization and deny-list policy and
+must avoid exposing protected directory contents. In particular, regex
+redaction is rejected as a security boundary because it cannot reliably
+identify secrets; deny-listing and the existing credential redaction boundary
+remain the controls for this first version.
 
 ## Consequences
 
