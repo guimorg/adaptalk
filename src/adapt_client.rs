@@ -42,6 +42,8 @@ pub enum AdaptClientError {
     AskAdaptOptInRequired,
     #[error("Adapt capability `{capability}` returned an error{detail}")]
     CapabilityFailed { capability: String, detail: String },
+    #[error("Adapt capability `{capability}` returned an error{detail}")]
+    AgentTimedOut { capability: String, detail: String },
     #[error("Adapt has no verified read-only capability available")]
     NoReadOnlyCapability,
 }
@@ -298,9 +300,16 @@ fn capability_failure(
     } else {
         format!(": {}", sanitize_transport_error(&message, credential))
     };
-    AdaptClientError::CapabilityFailed {
-        capability: capability.to_owned(),
-        detail,
+    if message.contains("Timed out waiting for the Adapt agent to reply") {
+        AdaptClientError::AgentTimedOut {
+            capability: capability.to_owned(),
+            detail,
+        }
+    } else {
+        AdaptClientError::CapabilityFailed {
+            capability: capability.to_owned(),
+            detail,
+        }
     }
 }
 
@@ -448,6 +457,19 @@ mod tests {
         assert!(message.contains("has expired"));
         assert!(message.contains("[redacted credential]"));
         assert!(!message.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn agent_reply_timeouts_are_distinguished_from_other_capability_errors() {
+        let content = vec![rmcp::model::Content::new(
+            RawContent::text("Error: Timed out waiting for the Adapt agent to reply."),
+            None,
+        )];
+
+        assert!(matches!(
+            capability_failure("ask_adapt", &content, "session-token"),
+            AdaptClientError::AgentTimedOut { .. }
+        ));
     }
 
     fn test_tool(name: &str) -> rmcp::model::Tool {
