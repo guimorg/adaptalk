@@ -187,10 +187,10 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
             }
             continue;
         }
-        let outbound_prompt = match FileReferenceResolver::for_current_dir()
+        let submission = match FileReferenceResolver::for_current_dir()
             .and_then(|resolver| resolver.resolve(&prompt))
         {
-            Ok(outbound_prompt) => outbound_prompt,
+            Ok(submission) => submission,
             Err(error) => {
                 repl.show_error(&format!("prompt error: {error}"))?;
                 continue;
@@ -212,7 +212,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 continue;
             }
         }
-        let result = controller.submit(&prompt, &outbound_prompt).await;
+        let result = controller.submit(submission).await;
         match result {
             Ok(SubmitOutcome::Response(response)) => {
                 render_response(&mut repl, response, presentation).await?

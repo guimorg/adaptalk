@@ -54,8 +54,9 @@ file contents
 </file>
 ```
 
-The path attribute is escaped for the block's syntax, and file contents are
-inserted as text without interpreting their contents as additional references.
+The path attribute and file contents are escaped for the block's syntax, so a
+referenced file cannot forge the closing `</file>` marker or add prompt-shaped
+markup. Escaped file contents are not interpreted as additional references.
 Canonical paths remain mandatory for all safety checks. A later broadening of
 the syntax may emit canonical paths, but ATUI-8 preserves the typed reference
 outwardly. Expansion is silent. Errors are reported as prompt errors without
@@ -68,9 +69,10 @@ The implementation applies checks in this order:
 1. resolve the CWD-relative path;
 2. canonicalize the path before every safety check;
 3. compare the canonical path against the built-in deny-list;
-4. inspect metadata and reject files over the configured maximum size (and
-   non-regular files); and
-5. read the file and construct the expansion block.
+4. open the canonical file once, inspect metadata from that handle, and reject
+   files over the configured maximum size (and non-regular files); and
+5. perform a bounded read from that same handle, then construct the escaped
+   expansion block.
 
 The deny-list is built in, fixed by the application, and compared against
 canonical paths. ATUI-8 denies `~/.adapt/config.toml` and every path under
