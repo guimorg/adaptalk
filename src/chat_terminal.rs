@@ -563,6 +563,15 @@ mod tests {
     }
 
     #[test]
+    fn renders_submitted_multiline_prompt_before_the_typing_indicator() {
+        let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
+        repl.show_you("first line\nsecond line").unwrap();
+        repl.show_working().unwrap();
+        let output = visible(&repl.into_output());
+        assert!(output.contains("You: first line\r\n  second line\r\nAdapt: is typing…\r\n"));
+    }
+
+    #[test]
     fn immediate_multiline_output_indents_continuation_lines() {
         let mut repl = super::Repl::with_output(Vec::new(), false).unwrap();
         repl.show_adapt("first\nsecond").unwrap();

@@ -3,7 +3,8 @@ use adaptalk::{
     chat_terminal::{Repl, ReplCommand, parse_command},
     config,
     conversation_controller::{
-        Connection, ConversationController, ConversationQuery, QueryFuture, SubmitOutcome,
+        Connection, ConversationController, ConversationQuery, QueryFuture, RemoteAgentTimeout,
+        SubmitOutcome,
     },
     file_references::FileReferenceResolver,
     redaction::Redactor,
@@ -18,6 +19,7 @@ use std::time::Duration;
 const ASK_ADAPT_WARNING: &str = "warning: ask_adapt is not verified as read-only and may perform mutations; use only for development investigations";
 const RESUME_REQUIRES_DEVELOPMENT_MODE: &str = "Remote continuation is available only with --allow-unverified-ask-adapt because it uses Adapt's unverified ask_adapt capability.";
 const CONTINUATION_FALLBACK_NOTICE: &str = "Remote continuation failed; the previous session may have expired. The next prompt starts a fresh Adapt session.";
+const ADAPT_CHAT_URL: &str = "https://app.adapt.com/chats/";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -70,10 +72,16 @@ impl ConversationQuery for TerminalQuery {
             let response = if self.allow_unverified_ask_adapt {
                 self.client
                     .query_ask_adapt_in_conversation(prompt, continuation, true)
-                    .await?
+                    .await
             } else {
-                self.client.query_read_only(prompt).await?
+                self.client.query_read_only(prompt).await
             };
+            let response = response.map_err(|error| match error {
+                adaptalk::adapt_client::AdaptClientError::AgentTimedOut { .. } => {
+                    anyhow::Error::new(RemoteAgentTimeout::new(error.to_string()))
+                }
+                error => error.into(),
+            })?;
             Ok(transcript::from_query_response(response))
         })
     }
@@ -196,7 +204,7 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                 continue;
             }
         };
-        repl.show_working()?;
+        show_submitted_prompt(&mut repl, &prompt)?;
         if controller.needs_connection() {
             let terminal_connection = match connect_terminal(allow_unverified_ask_adapt).await {
                 Ok(connection) => connection,
@@ -246,9 +254,36 @@ async fn run_terminal(allow_unverified_ask_adapt: bool) -> Result<()> {
                     "warning: the error could not be saved locally: {persistence_error}"
                 ))?;
             }
+            Ok(SubmitOutcome::ContinuationTimedOut { error, chat_id }) => {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(&continuation_timeout_notice(&chat_id))?;
+            }
+            Ok(SubmitOutcome::ContinuationTimedOutWithPersistenceWarning {
+                error,
+                chat_id,
+                persistence_error,
+            }) => {
+                repl.show_error(&controller.redact(&error.to_string()))?;
+                repl.show_notice(&continuation_timeout_notice(&chat_id))?;
+                repl.show_notice(&format!(
+                    "warning: the error could not be saved locally: {persistence_error}"
+                ))?;
+            }
             Err(error) => repl.show_error(&controller.redact(&error.to_string()))?,
         }
     }
+}
+
+fn continuation_timeout_notice(chat_id: &str) -> String {
+    format!(
+        "Adapt may still be working on this request. Check the conversation at {ADAPT_CHAT_URL}{chat_id}. Once it has responded, your next prompt will attempt to continue this conversation in adaptalk. That response will not appear in this local session."
+    )
+}
+
+fn show_submitted_prompt<W: std::io::Write>(repl: &mut Repl<W>, prompt: &str) -> Result<()> {
+    repl.show_you(prompt)?;
+    repl.show_working()?;
+    Ok(())
 }
 
 fn show_history(repl: &mut Repl, history: &SessionHistory) -> Result<()> {
@@ -327,13 +362,36 @@ fn compact(text: &str) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{Cli, ResponsePresentation};
+    use super::{Cli, ResponsePresentation, show_submitted_prompt};
+    use adaptalk::chat_terminal::Repl;
     use adaptalk::{adapt_client::QueryResponse, redaction::Redactor, transcript};
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use rmcp::model::{Content, RawContent};
     #[test]
     fn empty_arguments_do_not_submit_a_prompt() {
         assert!(Cli::try_parse_from(["adaptalk"]).unwrap().prompt.is_empty());
+    }
+
+    #[test]
+    fn submitted_multiline_prompt_remains_visible_while_adapt_is_typing() {
+        let mut repl = Repl::with_output(Vec::new(), false).unwrap();
+        show_submitted_prompt(&mut repl, "first line\nsecond line").unwrap();
+        let output_bytes = repl.into_output();
+        let output = String::from_utf8_lossy(&output_bytes);
+        assert!(output.contains("You"));
+        assert!(output.contains("first line\r\n  second line\r\n"));
+        assert!(output.contains("Adapt"));
+    }
+
+    #[test]
+    fn timeout_notice_links_to_the_remote_chat_and_explains_the_history_gap() {
+        let notice = super::continuation_timeout_notice("e1d65e51-2464-45cd-a19a-b2887324c01d");
+
+        assert!(
+            notice.contains("https://app.adapt.com/chats/e1d65e51-2464-45cd-a19a-b2887324c01d")
+        );
+        assert!(notice.contains("next prompt will attempt to continue"));
+        assert!(notice.contains("will not appear in this local session"));
     }
     #[test]
     fn prompt_arguments_are_joined_for_submission() {

@@ -3,6 +3,7 @@
 use std::pin::Pin;
 
 use anyhow::Result;
+use thiserror::Error;
 
 use crate::{
     redaction::Redactor,
@@ -11,6 +12,50 @@ use crate::{
 };
 
 pub type QueryFuture<'a> = Pin<Box<dyn Future<Output = Result<TranscriptResponse>> + 'a>>;
+
+/// One Chat Prompt in its two intentional forms: the user's input for Local Adapt History and
+/// the resolved message sent to Adapt.
+pub struct PromptSubmission {
+    original: String,
+    outbound: String,
+}
+
+impl PromptSubmission {
+    pub fn unchanged(prompt: impl Into<String>) -> Self {
+        let original = prompt.into();
+        Self {
+            outbound: original.clone(),
+            original,
+        }
+    }
+
+    pub(crate) fn expanded(original: impl Into<String>, outbound: String) -> Self {
+        Self {
+            original: original.into(),
+            outbound,
+        }
+    }
+
+    pub fn outbound(&self) -> &str {
+        &self.outbound
+    }
+}
+
+/// Marks an Adapt request that may still complete remotely after the client stopped waiting.
+///
+/// The controller keeps its remote chat ID in this case so a later prompt can continue the
+/// remote conversation. The missing response cannot be reconstructed into local history.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct RemoteAgentTimeout {
+    message: String,
+}
+
+impl RemoteAgentTimeout {
+    pub fn new(message: String) -> Self {
+        Self { message }
+    }
+}
 
 /// The narrow boundary needed to submit a prompt to an already-connected service.
 pub trait ConversationQuery {
@@ -39,6 +84,17 @@ pub enum SubmitOutcome {
     },
     ContinuationFailedWithPersistenceWarning {
         error: anyhow::Error,
+        persistence_error: crate::session_history::HistoryError,
+    },
+    /// Adapt stopped waiting for a response, but the remote request may still complete. The
+    /// continuation remains available for a later prompt.
+    ContinuationTimedOut {
+        error: anyhow::Error,
+        chat_id: String,
+    },
+    ContinuationTimedOutWithPersistenceWarning {
+        error: anyhow::Error,
+        chat_id: String,
         persistence_error: crate::session_history::HistoryError,
     },
 }
@@ -214,7 +270,8 @@ impl<Q: ConversationQuery> ConversationController<Q> {
                 }
             }
             Err(error) => {
-                if used_continuation {
+                let timed_out = error.downcast_ref::<RemoteAgentTimeout>().is_some();
+                if used_continuation && !timed_out {
                     active.continuation_exhausted = true;
                 }
                 match self.history.append_error(
@@ -222,14 +279,22 @@ impl<Q: ConversationQuery> ConversationController<Q> {
                     self.redactor.transcript_text(&error.to_string()),
                 ) {
                     Ok(()) => {
-                        if used_continuation {
+                        if let Some(chat_id) = continuation.filter(|_| timed_out) {
+                            Ok(SubmitOutcome::ContinuationTimedOut { error, chat_id })
+                        } else if used_continuation {
                             Ok(SubmitOutcome::ContinuationFailed { error })
                         } else {
                             Err(error)
                         }
                     }
                     Err(persistence_error) => {
-                        if used_continuation {
+                        if let Some(chat_id) = continuation.filter(|_| timed_out) {
+                            Ok(SubmitOutcome::ContinuationTimedOutWithPersistenceWarning {
+                                error,
+                                chat_id,
+                                persistence_error,
+                            })
+                        } else if used_continuation {
                             Ok(SubmitOutcome::ContinuationFailedWithPersistenceWarning {
                                 error,
                                 persistence_error,
@@ -284,6 +349,10 @@ mod tests {
         (SessionHistory::at(&directory), directory)
     }
 
+    fn submission(prompt: &str) -> PromptSubmission {
+        PromptSubmission::unchanged(prompt)
+    }
+
     #[tokio::test]
     async fn continuation_failure_drops_the_continuation_for_subsequent_prompts() {
         let (history, directory) = history("continuation-failure");
@@ -310,10 +379,6 @@ mod tests {
             .unwrap();
         assert!(matches!(
             controller.submit(submission("first")).await.unwrap(),
-    fn submission(prompt: &str) -> PromptSubmission {
-        PromptSubmission::unchanged(prompt)
-    }
-
             SubmitOutcome::ContinuationFailed { .. }
         ));
         assert!(matches!(
@@ -321,6 +386,46 @@ mod tests {
             SubmitOutcome::Response(_)
         ));
         assert_eq!(*calls.borrow(), vec![Some("chat-1".into()), None]);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn continuation_timeout_keeps_the_chat_id_for_a_later_prompt() {
+        let (history, directory) = history("continuation-timeout");
+        let mut origin = history.create().unwrap();
+        let origin_response = Redactor::default().transcript_response(response(Some("chat-1")));
+        history
+            .append_response(&mut origin, origin_response)
+            .unwrap();
+        let mut controller = ConversationController::new(history.clone());
+        controller.open(origin).unwrap();
+        let calls = Rc::new(RefCell::new(vec![]));
+        let query = Query {
+            calls: calls.clone(),
+            results: Rc::new(RefCell::new(vec![
+                Err(RemoteAgentTimeout::new("timed out".into()).into()),
+                Ok(response(None)),
+            ])),
+        };
+        controller
+            .connect(Connection {
+                query,
+                redactor: Redactor::default(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            controller.submit(submission("first")).await.unwrap(),
+            SubmitOutcome::ContinuationTimedOut { ref chat_id, .. } if chat_id == "chat-1"
+        ));
+        assert!(matches!(
+            controller.submit(submission("second")).await.unwrap(),
+            SubmitOutcome::Response(_)
+        ));
+        assert_eq!(
+            *calls.borrow(),
+            vec![Some("chat-1".into()), Some("chat-1".into())]
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -627,32 +732,5 @@ mod tests {
                 .all(|session| session.status() == &crate::session_history::SessionStatus::Active)
         );
         let _ = std::fs::remove_dir_all(directory);
-    }
-}
-/// One Chat Prompt in its two intentional forms: the user's input for Local Adapt History and
-/// the resolved message sent to Adapt.
-pub struct PromptSubmission {
-    original: String,
-    outbound: String,
-}
-
-impl PromptSubmission {
-    pub fn unchanged(prompt: impl Into<String>) -> Self {
-        let original = prompt.into();
-        Self {
-            outbound: original.clone(),
-            original,
-        }
-    }
-
-    pub(crate) fn expanded(original: impl Into<String>, outbound: String) -> Self {
-        Self {
-            original: original.into(),
-            outbound,
-        }
-    }
-
-    pub fn outbound(&self) -> &str {
-        &self.outbound
     }
 }
